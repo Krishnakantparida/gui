@@ -148,7 +148,7 @@ def build_svg(model: CassetteModel) -> str:
     for e in model.engines:
         cx, cy = e.center
         sx, sy = tx(cx), ty(cy)
-        r = e.radius
+        radius = e.radius / 2.5
         r, g, b = e.color_rgb
         fill = f"rgb({r},{g},{b})"
         train_label = train_label_by_id.get(e.train_id, e.train_id)
@@ -156,12 +156,12 @@ def build_svg(model: CassetteModel) -> str:
         tooltip_text = html.escape(tooltip_json, quote=True)
         data_train = html.escape(e.train_id, quote=True)
         parts.append(
-            f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="{r:.2f}" fill="{fill}" '
+            f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="{radius:.2f}" fill="{fill}" '
             f'fill-opacity="0.95" stroke="#e2e8f0" stroke-width="{stroke_width:.3f}" '
             f'class="engine-shape" data-train="{data_train}"></circle>'
         )
         parts.append(
-            f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="{r:.2f}" fill="transparent" '
+            f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="{radius:.2f}" fill="transparent" '
             f'stroke="none" class="engine-hit" style="cursor:pointer;" '
             f'data-train="{data_train}" '
             f'onmouseenter="cassetteHover(event, {tooltip_text})" '

@@ -46,9 +46,9 @@ ui.add_css("""
            color: white !important;
         }
     }
-    .legend-row { gap: 6px; }
+    .legend-row { gap: 4px; }
     .legend-swatch {
-        width: 16px; height: 16px; border-radius: 4px;
+        width: 11px; height: 11px; border-radius: 3px;
         border: 1px solid rgba(148,163,184,0.5);
         flex-shrink: 0;
     }
@@ -64,24 +64,28 @@ ui.add_css("""
     }
     .dimmed { opacity: 0.12 !important; }
     /* Legend overlay: pinned to the top-left corner of the display area,
-       semi-transparent so it doesn't fully obscure the cassette beneath. */
+       semi-transparent so it doesn't fully obscure the cassette beneath.
+       Sized at 2/3 (~1/1.5) of the original dimensions. */
     .legend-overlay {
         position: absolute;
-        top: 8px;
-        left: 8px;
+        top: 5px;
+        left: 5px;
         z-index: 40;
-        max-width: 240px;
-        max-height: calc(100% - 16px);
+        max-width: 160px;
+        max-height: calc(100% - 10px);
         overflow-y: auto;
-        padding: 10px 12px;
-        border-radius: 8px;
+        padding: 7px 8px;
+        border-radius: 5px;
         border: 1px solid rgba(148,163,184,0.35);
         background: rgba(15, 23, 42, 0.82);
         backdrop-filter: blur(4px);
     }
     .legend-overlay .q-checkbox__label {
-        font-size: 0.85rem;
+        font-size: 0.57rem;
     }
+    .legend-overlay .q-checkbox { min-height: 0; padding: 0; }
+    .legend-overlay .q-checkbox__inner { width: 22px; height: 22px; }
+    .legend-overlay .legend-row { gap: 4px; }
 """)
 
 # One set of hover-tooltip helpers shared by every rendered SVG. Positioning
