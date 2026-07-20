@@ -4,7 +4,8 @@ Enter a cassette name (the .dxf filename without extension) to load its
 layout: module footprints are classified (hexagonal / partial-hexagonal /
 tile) and grouped into "trains" by their fill color, and engines (the
 red circles on the ENGINES layer) are rendered alongside them. A
-checkbox legend lets you toggle the visibility of each train (and the
+checkbox legend -- overlaid in the top-left corner of the cassette
+display -- lets you toggle the visibility of each train (and the
 engines) in the interactive SVG. Hovering a module or engine reveals a
 tooltip with its details.
 """
@@ -17,6 +18,7 @@ from dxf_model import load_cassette, summarize
 from svg_builder import build_svg
 
 CASSETTE_DIR = Path(__file__).parent / "cassette_layouts"
+CMS_LOGO = Path(__file__).parent / "standard_images" / "CMS_logo-002.png"
 
 
 def discover_cassettes() -> list[str]:
@@ -46,7 +48,7 @@ ui.add_css("""
     }
     .legend-row { gap: 6px; }
     .legend-swatch {
-        width: 18px; height: 18px; border-radius: 4px;
+        width: 16px; height: 16px; border-radius: 4px;
         border: 1px solid rgba(148,163,184,0.5);
         flex-shrink: 0;
     }
@@ -61,6 +63,25 @@ ui.add_css("""
         transition: opacity 0.2s ease;
     }
     .dimmed { opacity: 0.12 !important; }
+    /* Legend overlay: pinned to the top-left corner of the display area,
+       semi-transparent so it doesn't fully obscure the cassette beneath. */
+    .legend-overlay {
+        position: absolute;
+        top: 8px;
+        left: 8px;
+        z-index: 40;
+        max-width: 240px;
+        max-height: calc(100% - 16px);
+        overflow-y: auto;
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid rgba(148,163,184,0.35);
+        background: rgba(15, 23, 42, 0.82);
+        backdrop-filter: blur(4px);
+    }
+    .legend-overlay .q-checkbox__label {
+        font-size: 0.85rem;
+    }
 """)
 
 # One set of hover-tooltip helpers shared by every rendered SVG. Positioning
@@ -114,14 +135,24 @@ ui.add_head_html(
 dark_mode = ui.dark_mode()
 dark_mode.enable()  # start in dark mode
 
-with ui.row().classes("w-full items-center justify-between"):
-    with ui.column():
-        ui.label("High Granularity Calorimeter (CE-H)").style(
-            "font-size:24px;font-weight:bold;"
-        )
-        ui.label("Single Cassette Tester").style(
-            "font-size:24px;font-weight:bold;"
-        )
+# ============================================================
+# Header: CMS logo + title on the left, menu dropdown on the right
+# ============================================================
+with ui.row().classes("w-full items-center justify-between no-wrap"):
+    with ui.row().classes("items-center gap-4 no-wrap"):
+        # CMS logo first
+        if CMS_LOGO.exists():
+            ui.image(str(CMS_LOGO)).style(
+                "height:56px; width:auto; object-fit:contain;"
+            ).props("alt=CMS logo")
+        # then the title
+        with ui.column().classes("gap-0"):
+            ui.label("High Granularity Calorimeter (CE-H)").style(
+                "font-size:24px;font-weight:bold;"
+            )
+            ui.label("Single Cassette Tester").style(
+                "font-size:24px;font-weight:bold;"
+            )
 
     with ui.button(icon="menu").props("flat round"):
         with ui.menu().props('trigger="hover"'):
@@ -151,14 +182,14 @@ ui.separator()
 
 # state shared between the input handler and the legend
 state = {
-    "model": None,         # last loaded CassetteModel
-    "visible_trains": {},   # train_id -> bool
+    "model": None,          # last loaded CassetteModel
+    "visible_trains": {},    # train_id -> bool
     "engines_visible": True,
 }
 
 with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
     # ============================================================
-    # LEFT COLUMN - Cassette entry + summary + legend
+    # LEFT COLUMN - Cassette entry + summary
     # ============================================================
     with ui.column().classes("flex-1 gap-3"):
         ui.markdown("## Cassette Information")
@@ -185,14 +216,8 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
             .props("flat bordered hide-header")
         )
 
-        ui.markdown("### Legend")
-        legend_hint = ui.label("Load a cassette to see trains.").classes(
-            "text-sm text-gray-400"
-        )
-        legend_container = ui.column().classes("w-full gap-1")
-
     # ============================================================
-    # RIGHT COLUMN - Interactive cassette display
+    # RIGHT COLUMN - Interactive cassette display with legend overlay
     # ============================================================
     with ui.column().classes("flex-1 h-full"):
         with (
@@ -204,6 +229,13 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
             svg_slot = ui.element("div").classes(
                 "cassette-svg-wrap w-full h-full flex items-center justify-center"
             )
+
+            # Legend overlay pinned to the top-left corner of the display area
+            with ui.column().classes("legend-overlay gap-1") as legend_container:
+                legend_hint = ui.label("Load a cassette to see trains.").classes(
+                    "text-sm text-gray-400"
+                )
+
             ui.element("div").props('id="cassette-tooltip"').classes(
                 "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
             ).style(
@@ -215,15 +247,17 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
 
 def _render_legend(model) -> None:
     """Build the checkbox legend from the model's trains and engines."""
-    legend_hint.set_text("Tick a train to show it; untick to hide it.")
     legend_container.clear()
     with legend_container:
+        legend_hint = ui.label("Tick a train to show it; untick to hide it.").classes(
+            "text-sm text-gray-400"
+        )
         for t in model.trains:
             r, g, b = t.color_rgb
             swatch = f"rgb({r},{g},{b})"
             with ui.row().classes("legend-row w-full items-center"):
                 cb = ui.checkbox(
-                    label=t.label,
+                    text=t.label,
                     value=True,
                     on_change=lambda e, tid=t.id: _on_train_toggle(tid, e.value),
                 ).classes("flex-1")
@@ -238,7 +272,7 @@ def _render_legend(model) -> None:
                 r, g, b = e0.color_rgb
                 swatch = f"rgb({r},{g},{b})"
                 ui.checkbox(
-                    label="Engines",
+                    text="Engines",
                     value=True,
                     on_change=lambda e: _on_engines_toggle(e.value),
                 ).classes("flex-1").tooltip("Red circles on the ENGINES layer")
@@ -272,7 +306,10 @@ def load_selected(name: str) -> None:
     summary_table.rows = []
     summary_table.update()
     legend_container.clear()
-    legend_hint.set_text("Load a cassette to see trains.")
+    with legend_container:
+        ui.label("Load a cassette to see trains.").classes(
+            "text-sm text-gray-400"
+        )
 
     if not name:
         return
@@ -284,9 +321,10 @@ def load_selected(name: str) -> None:
                 f"No file named '{name}.dxf' in cassette_layouts/."
             ).classes("text-red-400")
         if available:
-            legend_hint.set_text(
-                f"Available: {', '.join(available)}"
-            )
+            with legend_container:
+                ui.label(
+                    f"Available: {', '.join(available)}"
+                ).classes("text-sm text-gray-400")
         return
 
     try:
