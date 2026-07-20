@@ -1,0 +1,371 @@
+"""
+Parsing and geometric classification of cassette DXF layouts.
+
+Domain model
+------------
+A cassette layout is made of:
+  - LWPOLYLINE entities  -> the outline of a physical module footprint
+  - HATCH entities       -> the filled/colored region inside a module
+                            (the fill color groups modules into "trains",
+                            i.e. differently colored readout chains)
+  - MTEXT entities       -> a text label placed inside a module
+
+A LWPOLYLINE is only counted as a "module" if a HATCH region is matched to
+it (this filters out decorative/frame/outline-only geometry that isn't an
+actual populated module footprint).
+
+Shape classification is purely geometric (vertex count + interior angles),
+because that's the only reliable general-purpose way to tell a hexagonal
+(or partially-cut hexagonal) module apart from a tile module without any
+extra metadata in the DXF:
+
+  - "tile"        -> an even vertex count from 4 to 12, with ~all interior
+                     angles close to 90 degrees. A plain rectangle is the
+                     4-sided case; a rectangle with one or more rectangular
+                     notches/steps cut into it (still an all-right-angle
+                     outline) adds 2 vertices per notch, up to 12 -- every
+                     corner, convex or concave, still measures ~90 degrees
+                     as an unsigned interior angle, so no special-casing of
+                     notch direction is needed.
+  - "hex_full"    -> 6 vertices, ~all interior angles close to 120 degrees
+                     and roughly equal edge lengths
+  - "hex_partial" -> anything else, i.e. "part of" a hexagon -- this
+                     deliberately covers footprints with 3, 4, 5, or 7+
+                     vertices (corner-clipped, chamfered, or edge-cut
+                     hexagons), not just the common 4-sided case
+
+These thresholds are heuristics. They were tuned against synthetic sample
+layouts (see generate_samples.py) since no real cassette DXF was available
+at build time -- validate/tune against real files in cassette_layouts/.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+import ezdxf
+from ezdxf.colors import aci2rgb
+from ezdxf.math import bulge_to_arc
+from shapely.geometry import Point, Polygon
+
+# ---------------------------------------------------------------------------
+# Tunables (see module docstring)
+# ---------------------------------------------------------------------------
+TILE_ANGLE_CENTER = 90.0
+TILE_ANGLE_TOLERANCE = 18.0
+TILE_MIN_SIDES = 4
+TILE_MAX_SIDES = 12
+
+HEX_ANGLE_CENTER = 120.0
+HEX_ANGLE_TOLERANCE = 16.0
+HEX_EDGE_RATIO_MAX = 1.45
+
+COLLINEAR_ANGLE_THRESHOLD = 165.0  # merge vertices whose corner is this straight
+ARC_SAMPLES_PER_BULGE = 8
+
+DEFAULT_COLOR_RGB = (148, 163, 184)  # slate-400, used when color can't be resolved
+
+
+@dataclass
+class Module:
+    id: str
+    polygon: list[tuple[float, float]]  # cleaned, closed-implied vertex loop
+    shape: str  # "hex_full" | "hex_partial" | "tile"
+    color_key: str
+    color_rgb: tuple[int, int, int]
+    label: str
+    centroid: tuple[float, float]
+
+
+@dataclass
+class CassetteModel:
+    name: str
+    modules: list[Module] = field(default_factory=list)
+    bounds: tuple[float, float, float, float] = (0, 0, 1, 1)  # minx, miny, maxx, maxy
+
+
+@dataclass
+class CassetteSummary:
+    cassette_type: str  # "Pure silicon" | "Mixed"
+    full_hex: int
+    partial_hex: int
+    tile: int
+    trains: int
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+def _flatten_lwpolyline(points_xyb: list[tuple[float, float, float]], closed: bool) -> list[tuple[float, float]]:
+    """Flatten a LWPOLYLINE's (x, y, bulge) vertices into a plain point loop,
+    replacing bulge segments with sampled arc points."""
+    pts: list[tuple[float, float]] = []
+    n = len(points_xyb)
+    if n == 0:
+        return pts
+
+    segment_count = n if closed else n - 1
+    for i in range(n):
+        x, y, bulge = points_xyb[i]
+        pts.append((x, y))
+        if i >= segment_count:
+            continue
+        if abs(bulge) > 1e-9:
+            nxt = points_xyb[(i + 1) % n]
+            try:
+                center, start_angle, end_angle, radius = bulge_to_arc((x, y), (nxt[0], nxt[1]), bulge)
+            except Exception:
+                continue
+            sweep = end_angle - start_angle
+            while sweep <= 0:
+                sweep += 2 * math.pi
+            for s in range(1, ARC_SAMPLES_PER_BULGE):
+                t = start_angle + sweep * (s / ARC_SAMPLES_PER_BULGE)
+                pts.append((center[0] + radius * math.cos(t), center[1] + radius * math.sin(t)))
+    return pts
+
+
+def _dedupe_points(points: list[tuple[float, float]], tol: float = 1e-6) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for p in points:
+        if not out or math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > tol:
+            out.append(p)
+    if len(out) > 1 and math.hypot(out[0][0] - out[-1][0], out[0][1] - out[-1][1]) <= tol:
+        out.pop()
+    return out
+
+
+def _interior_angle(p0, p1, p2) -> float:
+    v1 = (p0[0] - p1[0], p0[1] - p1[1])
+    v2 = (p2[0] - p1[0], p2[1] - p1[1])
+    n1 = math.hypot(*v1)
+    n2 = math.hypot(*v2)
+    if n1 < 1e-9 or n2 < 1e-9:
+        return 180.0
+    dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(math.acos(dot))
+
+
+def _simplify_polygon(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Remove near-duplicate and near-collinear vertices so vertex count
+    reflects the shape's actual corner count."""
+    pts = _dedupe_points(points)
+    if len(pts) < 4:
+        return pts
+    changed = True
+    while changed and len(pts) > 3:
+        changed = False
+        n = len(pts)
+        for i in range(n):
+            p0, p1, p2 = pts[(i - 1) % n], pts[i], pts[(i + 1) % n]
+            if _interior_angle(p0, p1, p2) >= COLLINEAR_ANGLE_THRESHOLD:
+                pts.pop(i)
+                changed = True
+                break
+    return pts
+
+
+def _edge_lengths(points: list[tuple[float, float]]) -> list[float]:
+    n = len(points)
+    return [math.hypot(points[(i + 1) % n][0] - points[i][0], points[(i + 1) % n][1] - points[i][1]) for i in range(n)]
+
+
+def classify_shape(points: list[tuple[float, float]]) -> str:
+    pts = _simplify_polygon(points)
+    n = len(pts)
+    if n < 3:
+        return "hex_partial"
+
+    angles = [_interior_angle(pts[(i - 1) % n], pts[i], pts[(i + 1) % n]) for i in range(n)]
+
+    if TILE_MIN_SIDES <= n <= TILE_MAX_SIDES and n % 2 == 0:
+        if all(abs(a - TILE_ANGLE_CENTER) <= TILE_ANGLE_TOLERANCE for a in angles):
+            return "tile"
+
+    if n == 6:
+        angles_ok = all(abs(a - HEX_ANGLE_CENTER) <= HEX_ANGLE_TOLERANCE for a in angles)
+        lengths = _edge_lengths(pts)
+        edge_ratio = max(lengths) / max(min(lengths), 1e-9)
+        if angles_ok and edge_ratio <= HEX_EDGE_RATIO_MAX:
+            return "hex_full"
+
+    return "hex_partial"
+
+
+def _centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
+    poly = Polygon(points)
+    if not poly.is_valid or poly.area == 0:
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
+    c = poly.centroid
+    return (c.x, c.y)
+
+
+# ---------------------------------------------------------------------------
+# Color resolution
+# ---------------------------------------------------------------------------
+def _resolve_color(entity, doc) -> tuple[str, tuple[int, int, int]]:
+    """Return (stable_key, rgb) for an entity's effective color."""
+    true_color = entity.dxf.get("true_color", None)
+    if true_color is not None:
+        rgb = ((true_color >> 16) & 0xFF, (true_color >> 8) & 0xFF, true_color & 0xFF)
+        return f"true:{true_color}", rgb
+
+    aci = entity.dxf.get("color", 256)
+    if aci in (256, 0):  # BYLAYER / BYBLOCK -> resolve via layer
+        layer_name = entity.dxf.get("layer", "0")
+        layer = doc.layers.get(layer_name) if doc.layers.has_entry(layer_name) else None
+        if layer is not None:
+            layer_true_color = layer.dxf.get("true_color", None)
+            if layer_true_color is not None:
+                rgb = ((layer_true_color >> 16) & 0xFF, (layer_true_color >> 8) & 0xFF, layer_true_color & 0xFF)
+                return f"layer_true:{layer_true_color}", rgb
+            aci = layer.dxf.get("color", 7)
+        else:
+            aci = 7
+
+    try:
+        rgb = aci2rgb(abs(aci))
+    except Exception:
+        rgb = DEFAULT_COLOR_RGB
+    return f"aci:{abs(aci)}", rgb
+
+
+# ---------------------------------------------------------------------------
+# Main parse entrypoint
+# ---------------------------------------------------------------------------
+def load_cassette(filepath: str, name: str) -> CassetteModel:
+    doc = ezdxf.readfile(filepath)
+    msp = doc.modelspace()
+
+    # --- collect candidate module outlines from LWPOLYLINE ---
+    outlines = []
+    for e in msp.query("LWPOLYLINE"):
+        if not e.closed:
+            continue
+        raw = list(e.get_points("xyb"))
+        pts = _flatten_lwpolyline(raw, closed=True)
+        pts = _dedupe_points(pts)
+        if len(pts) < 3:
+            continue
+        poly = Polygon(pts)
+        if not poly.is_valid or poly.area <= 1e-6:
+            continue
+        outlines.append({"points": pts, "polygon": poly, "centroid": _centroid(pts)})
+
+    # --- collect HATCH regions (color + a representative point) ---
+    hatches = []
+    for e in msp.query("HATCH"):
+        color_key, color_rgb = _resolve_color(e, doc)
+        # representative point: centroid of the first boundary path
+        rep_point = None
+        try:
+            for path in e.paths:
+                verts = None
+                if hasattr(path, "vertices") and path.vertices:
+                    verts = [(v[0], v[1]) for v in path.vertices]
+                elif hasattr(path, "edges"):
+                    verts = []
+                    for edge in path.edges:
+                        start = getattr(edge, "start", None)
+                        if start is not None:
+                            verts.append((start[0], start[1]))
+                if verts and len(verts) >= 3:
+                    rep_point = _centroid(verts)
+                    break
+        except Exception:
+            rep_point = None
+        if rep_point is None:
+            continue
+        hatches.append({"point": rep_point, "color_key": color_key, "color_rgb": color_rgb})
+
+    # --- match each hatch to the outline that contains it ---
+    outline_hatch: dict[int, dict] = {}
+    for h in hatches:
+        pt = Point(h["point"])
+        best_idx = None
+        best_dist = None
+        for idx, o in enumerate(outlines):
+            if o["polygon"].contains(pt) or o["polygon"].distance(pt) < 1e-6:
+                # contained: pick the smallest containing polygon (nested shapes safety)
+                dist = o["polygon"].area
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+        if best_idx is None:
+            # fall back to nearest centroid within a reasonable radius
+            for idx, o in enumerate(outlines):
+                dist = pt.distance(Point(o["centroid"]))
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+        if best_idx is not None:
+            outline_hatch[best_idx] = h
+
+    # --- collect MTEXT labels ---
+    labels = []
+    for e in msp.query("MTEXT"):
+        insert = e.dxf.insert
+        try:
+            text = e.plain_text()
+        except Exception:
+            text = e.text
+        labels.append({"point": (insert[0], insert[1]), "text": text.strip()})
+
+    # --- build modules: only outlines with a matched hatch count as modules ---
+    modules: list[Module] = []
+    for idx, o in enumerate(outlines):
+        hatch = outline_hatch.get(idx)
+        if hatch is None:
+            continue
+        shape = classify_shape(o["points"])
+
+        # find the label whose insertion point falls inside this module
+        label_text = ""
+        best_label_dist = None
+        for lab in labels:
+            pt = Point(lab["point"])
+            if o["polygon"].contains(pt):
+                label_text = lab["text"]
+                break
+            dist = pt.distance(Point(o["centroid"]))
+            if best_label_dist is None or dist < best_label_dist:
+                if o["polygon"].distance(pt) < max(o["polygon"].length * 0.05, 1e-6):
+                    best_label_dist = dist
+                    label_text = lab["text"]
+
+        modules.append(
+            Module(
+                id=f"module-{idx}",
+                polygon=o["points"],
+                shape=shape,
+                color_key=hatch["color_key"],
+                color_rgb=hatch["color_rgb"],
+                label=label_text or f"Module {idx + 1}",
+                centroid=o["centroid"],
+            )
+        )
+
+    all_x = [p[0] for m in modules for p in m.polygon] or [0, 1]
+    all_y = [p[1] for m in modules for p in m.polygon] or [0, 1]
+    bounds = (min(all_x), min(all_y), max(all_x), max(all_y))
+
+    return CassetteModel(name=name, modules=modules, bounds=bounds)
+
+
+def summarize(model: CassetteModel) -> CassetteSummary:
+    full_hex = sum(1 for m in model.modules if m.shape == "hex_full")
+    partial_hex = sum(1 for m in model.modules if m.shape == "hex_partial")
+    tile = sum(1 for m in model.modules if m.shape == "tile")
+    trains = len({m.color_key for m in model.modules})
+    cassette_type = "Mixed" if tile > 0 else "Pure silicon"
+    return CassetteSummary(
+        cassette_type=cassette_type,
+        full_hex=full_hex,
+        partial_hex=partial_hex,
+        tile=tile,
+        trains=trains,
+    )
