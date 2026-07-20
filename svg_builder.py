@@ -1,11 +1,12 @@
 """Build an interactive SVG for a CassetteModel.
 
-Each module is rendered as a filled+outlined shape with a transparent
-"hit" overlay that drives hover tooltips via a few small global JS
-functions (defined once in main.py via ui.add_head_html). Hover math is
-done in screen pixels against the display container's bounding rect, so
-it works correctly regardless of how the SVG is scaled to fit its
-flex-1 container.
+Each module is rendered as a filled+outlined shape with its module code
+and (u,v) coordinates drawn as text on top, plus a transparent "hit"
+overlay that drives hover tooltips via a few small global JS functions
+(defined once in main_test.py via ui.add_head_html). Engines are drawn
+as filled circles with their own hit overlays. Hover math is done in
+screen pixels against the display container's bounding rect, so it works
+correctly regardless of how the SVG is scaled to fit its flex-1 container.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import html
 import json
 
-from dxf_model import CassetteModel
+from dxf_model import CassetteModel, Module, Engine
 
 PADDING_RATIO = 0.06
 
@@ -23,9 +24,35 @@ SHAPE_STROKE = {
     "tile": "#e2e8f0",
 }
 
+SHAPE_LABEL = {
+    "hex_full": "Full hexagonal",
+    "hex_partial": "Partial hexagonal",
+    "tile": "Tile",
+}
 
-def _to_svg_points(points: list[tuple[float, float]], minx: float, height: float, miny: float) -> str:
-    return " ".join(f"{(x - minx):.2f},{(height - (y - miny)):.2f}" for x, y in points)
+
+def _module_tooltip(m: Module, train_label: str) -> str:
+    """Tooltip text for a module: everything NOT already drawn on the shape."""
+    lines = [f"Code: {m.code}"]
+    if m.uv is not None:
+        lines.append(f"(u, v): ({m.uv[0]}, {m.uv[1]})")
+    lines.append(f"Shape: {SHAPE_LABEL.get(m.shape, m.shape)}")
+    lines.append(f"Train: {train_label}")
+    r, g, b = m.color_rgb
+    lines.append(f"Color: rgb({r}, {g}, {b})")
+    return "\n".join(lines)
+
+
+def _engine_tooltip(e: Engine, train_label: str) -> str:
+    """Tooltip text for an engine."""
+    lines = ["Engine"]
+    lines.append(f"Train: {train_label}")
+    r, g, b = e.color_rgb
+    lines.append(f"Color: rgb({r}, {g}, {b})")
+    cx, cy = e.center
+    lines.append(f"Center: ({cx:.2f}, {cy:.2f})")
+    lines.append(f"Radius: {e.radius:.2f}")
+    return "\n".join(lines)
 
 
 def build_svg(model: CassetteModel) -> str:
@@ -42,8 +69,16 @@ def build_svg(model: CassetteModel) -> str:
 
     # translate module points into a top-left-origin, Y-down coordinate
     # space sized (view_w, view_h) so the viewBox can start at 0,0
+    def tx(x: float) -> float:
+        return x - view_minx
+
+    def ty(y: float) -> float:
+        return view_h - (y - view_miny)
+
     def pts_str(points: list[tuple[float, float]]) -> str:
-        return " ".join(f"{(x - view_minx):.2f},{(view_h - (y - view_miny)):.2f}" for x, y in points)
+        return " ".join(f"{tx(x):.2f},{ty(y):.2f}" for x, y in points)
+
+    train_label_by_id = {t.id: t.label for t in model.trains}
 
     parts: list[str] = []
     parts.append(
@@ -51,7 +86,7 @@ def build_svg(model: CassetteModel) -> str:
         f'preserveAspectRatio="xMidYMid meet" style="width:100%;height:100%;display:block;">'
     )
 
-    if not model.modules:
+    if not model.modules and not model.engines:
         parts.append(
             f'<text x="{view_w / 2:.2f}" y="{view_h / 2:.2f}" text-anchor="middle" '
             f'fill="#94a3b8" font-size="{max(view_w, view_h) * 0.04:.2f}">No module regions detected</text>'
@@ -60,30 +95,78 @@ def build_svg(model: CassetteModel) -> str:
         return "".join(parts)
 
     stroke_width = max(view_w, view_h) * 0.0035
+    font_size = max(view_w, view_h) * 0.022
+    # choose a readable text color per module: white on dark fills, dark on light fills
+    def text_color(rgb: tuple[int, int, int]) -> str:
+        r, g, b = rgb
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        return "#0f172a" if luminance > 140 else "#f8fafc"
 
     for m in model.modules:
         points = pts_str(m.polygon)
         r, g, b = m.color_rgb
         fill = f"rgb({r},{g},{b})"
-        # JSON-encode first (so cassetteHover receives a JS string literal),
-        # then HTML-escape the whole thing since it's embedded inside a
-        # double-quoted HTML attribute -- otherwise any `"` in the label
-        # text (or the JSON encoding itself) terminates the attribute early
-        # and truncates the inline onmouseenter handler mid-expression.
-        tooltip_json = json.dumps(f"{m.label}\n{m.shape.replace('_', ' ').title()}")
+        train_label = train_label_by_id.get(m.train_id, m.train_id)
+        tooltip_json = json.dumps(_module_tooltip(m, train_label))
         tooltip_text = html.escape(tooltip_json, quote=True)
+        data_train = html.escape(m.train_id, quote=True)
 
         parts.append(
-            f'<polygon points="{points}" fill="{fill}" fill-opacity="0.62" '
+            f'<polygon points="{points}" fill="{fill}" fill-opacity="0.82" '
             f'stroke="{SHAPE_STROKE.get(m.shape, "#e2e8f0")}" stroke-width="{stroke_width:.3f}" '
-            f'class="module-shape" data-shape="{html.escape(m.shape)}"></polygon>'
+            f'class="module-shape" data-shape="{html.escape(m.shape)}" '
+            f'data-train="{data_train}"></polygon>'
+        )
+        # module code + (u,v) text drawn at the centroid
+        cx, cy = m.centroid
+        sx, sy = tx(cx), ty(cy)
+        tcolor = text_color(m.color_rgb)
+        label_lines = [m.code]
+        if m.uv is not None:
+            label_lines.append(f"({m.uv[0]},{m.uv[1]})")
+        parts.append(
+            f'<text x="{sx:.2f}" y="{sy:.2f}" text-anchor="middle" '
+            f'dominant-baseline="central" fill="{tcolor}" '
+            f'font-size="{font_size:.2f}" font-family="monospace" '
+            f'font-weight="600" pointer-events="none" '
+            f'class="module-label" data-train="{data_train}">'
+            + "".join(
+                f'<tspan x="{sx:.2f}" dy="{i * 1.1:.2f}em">{html.escape(ln)}</tspan>'
+                for i, ln in enumerate(label_lines)
+            )
+            + "</text>"
         )
         parts.append(
             f'<polygon points="{points}" fill="transparent" stroke="none" '
             f'class="module-hit" style="cursor:pointer;" '
+            f'data-train="{data_train}" '
             f'onmouseenter="cassetteHover(event, {tooltip_text})" '
             f'onmousemove="cassetteMove(event)" '
             f'onmouseleave="cassetteLeave(event)"></polygon>'
+        )
+
+    for e in model.engines:
+        cx, cy = e.center
+        sx, sy = tx(cx), ty(cy)
+        r = e.radius
+        r, g, b = e.color_rgb
+        fill = f"rgb({r},{g},{b})"
+        train_label = train_label_by_id.get(e.train_id, e.train_id)
+        tooltip_json = json.dumps(_engine_tooltip(e, train_label))
+        tooltip_text = html.escape(tooltip_json, quote=True)
+        data_train = html.escape(e.train_id, quote=True)
+        parts.append(
+            f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="{r:.2f}" fill="{fill}" '
+            f'fill-opacity="0.95" stroke="#e2e8f0" stroke-width="{stroke_width:.3f}" '
+            f'class="engine-shape" data-train="{data_train}"></circle>'
+        )
+        parts.append(
+            f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="{r:.2f}" fill="transparent" '
+            f'stroke="none" class="engine-hit" style="cursor:pointer;" '
+            f'data-train="{data_train}" '
+            f'onmouseenter="cassetteHover(event, {tooltip_text})" '
+            f'onmousemove="cassetteMove(event)" '
+            f'onmouseleave="cassetteLeave(event)"></circle>'
         )
 
     parts.append("</svg>")

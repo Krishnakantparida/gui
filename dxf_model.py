@@ -8,7 +8,21 @@ A cassette layout is made of:
   - HATCH entities       -> the filled/colored region inside a module
                             (the fill color groups modules into "trains",
                             i.e. differently colored readout chains)
-  - MTEXT entities       -> a text label placed inside a module
+  - MTEXT entities       -> text labels. Two kinds, distinguished by
+                            ``dxf.color``:
+                              * color == 250 -> a module label, formatted as
+                                "<code>\n(<u>,<v>)" where <code> is e.g.
+                                "M3", "E3", "W2", "G8" and (u,v) are the
+                                module's (u,v) coordinates on a second line.
+                                Some older cassettes omit the (u,v) line.
+                              * color == 0   -> a train label, e.g. "TL1",
+                                "TL2", "LD1", "HD1" -- the human-readable
+                                name of a train, placed near the train's
+                                engine(s).
+  - CIRCLE entities on layer "ENGINES" -> the "engine" of a train. Engines
+    are drawn in the same color as the train they belong to (a dark-red
+    shade for the "red" trains, magenta for others). An engine is matched
+    to a train by color.
 
 A LWPOLYLINE is only counted as a "module" if a HATCH region is matched to
 it (this filters out decorative/frame/outline-only geometry that isn't an
@@ -66,23 +80,51 @@ ARC_SAMPLES_PER_BULGE = 8
 
 DEFAULT_COLOR_RGB = (148, 163, 184)  # slate-400, used when color can't be resolved
 
+ENGINES_LAYER = "ENGINES"
+MODULE_LABEL_COLOR = 250  # MTEXT dxf.color for module labels (code + (u,v))
+TRAIN_LABEL_COLOR = 0      # MTEXT dxf.color for train names (TL1, LD1, ...)
+
+
+@dataclass
+class Train:
+    """A readout train: a group of modules + engines sharing one fill color."""
+    id: str                       # stable key, e.g. "aci:246"
+    label: str                    # human name, e.g. "TL1" or "Train 1"; falls back to id
+    color_key: str
+    color_rgb: tuple[int, int, int]
+
 
 @dataclass
 class Module:
     id: str
     polygon: list[tuple[float, float]]  # cleaned, closed-implied vertex loop
     shape: str  # "hex_full" | "hex_partial" | "tile"
+    train_id: str
     color_key: str
     color_rgb: tuple[int, int, int]
-    label: str
+    code: str               # e.g. "M3", "E3", "W2", "G8"
+    uv: tuple[int, int] | None  # (u, v) coordinates parsed from the label, if present
+    label: str             # full original label text (may include the (u,v) line)
     centroid: tuple[float, float]
+
+
+@dataclass
+class Engine:
+    id: str
+    center: tuple[float, float]
+    radius: float
+    train_id: str
+    color_key: str
+    color_rgb: tuple[int, int, int]
 
 
 @dataclass
 class CassetteModel:
     name: str
     modules: list[Module] = field(default_factory=list)
-    bounds: tuple[float, float, float, float] = (0, 0, 1, 1)  # minx, miny, maxx, maxy
+    engines: list[Engine] = field(default_factory=list)
+    trains: list[Train] = field(default_factory=list)
+    bounds: tuple[float, float, float, float] = (0, 0, 1, 1)
 
 
 @dataclass
@@ -92,6 +134,7 @@ class CassetteSummary:
     partial_hex: int
     tile: int
     trains: int
+    engines: int
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +278,73 @@ def _resolve_color(entity, doc) -> tuple[str, tuple[int, int, int]]:
 
 
 # ---------------------------------------------------------------------------
+# Label parsing
+# ---------------------------------------------------------------------------
+def _parse_module_label(text: str) -> tuple[str, tuple[int, int] | None]:
+    """Split a module MTEXT body into (code, (u,v) | None).
+
+    The body is typically "M3\\n(3,2)" -- first line is the module code, the
+    optional second line is "(u,v)". Some cassettes only have the code line.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    code = lines[0] if lines else text.strip()
+    uv: tuple[int, int] | None = None
+    for ln in lines[1:]:
+        body = ln.strip("() ")
+        parts = [p.strip() for p in body.split(",")]
+        if len(parts) == 2:
+            try:
+                uv = (int(parts[0]), int(parts[1]))
+                break
+            except ValueError:
+                continue
+    return code, uv
+
+
+# ---------------------------------------------------------------------------
+# Train registry
+# ---------------------------------------------------------------------------
+class _TrainRegistry:
+    """Collects trains by color_key, assigning sequential ids and labels."""
+
+    def __init__(self) -> None:
+        self._by_key: dict[str, Train] = {}
+        self._order: list[str] = []
+
+    def get_or_create(self, color_key: str, color_rgb: tuple[int, int, int]) -> Train:
+        if color_key in self._by_key:
+            return self._by_key[color_key]
+        idx = len(self._by_key) + 1
+        train = Train(
+            id=color_key,
+            label=f"Train {idx}",
+            color_key=color_key,
+            color_rgb=color_rgb,
+        )
+        self._by_key[color_key] = train
+        self._order.append(color_key)
+        return train
+
+    def all(self) -> list[Train]:
+        return [self._by_key[k] for k in self._order]
+
+    def try_assign_label(self, color_key: str, label: str) -> None:
+        train = self._by_key.get(color_key)
+        if train is None:
+            return
+        # keep the first non-default label we see
+        if train.label.startswith("Train "):
+            train.label = label
+
+
+# ---------------------------------------------------------------------------
 # Main parse entrypoint
 # ---------------------------------------------------------------------------
 def load_cassette(filepath: str, name: str) -> CassetteModel:
     doc = ezdxf.readfile(filepath)
     msp = doc.modelspace()
+
+    trains = _TrainRegistry()
 
     # --- collect candidate module outlines from LWPOLYLINE ---
     outlines = []
@@ -304,16 +409,94 @@ def load_cassette(filepath: str, name: str) -> CassetteModel:
                     best_idx = idx
         if best_idx is not None:
             outline_hatch[best_idx] = h
+            trains.get_or_create(h["color_key"], h["color_rgb"])
 
-    # --- collect MTEXT labels ---
-    labels = []
+    # --- collect MTEXT labels, split into module vs train labels ---
+    module_labels: list[dict] = []
+    train_label_points: list[dict] = []
     for e in msp.query("MTEXT"):
         insert = e.dxf.insert
         try:
             text = e.plain_text()
         except Exception:
             text = e.text
-        labels.append({"point": (insert[0], insert[1]), "text": text.strip()})
+        text = text.strip()
+        if not text:
+            continue
+        color = e.dxf.get("color", 256)
+        point = (insert[0], insert[1])
+        if color == TRAIN_LABEL_COLOR:
+            train_label_points.append({"point": point, "text": text})
+        else:
+            # treat everything else as a candidate module label (the canonical
+            # marker is color 250, but be lenient in case other cassettes vary)
+            module_labels.append({"point": point, "text": text})
+
+    # --- collect engines (CIRCLE on ENGINES layer) ---
+    engine_entries: list[dict] = []
+    for c in msp.query("CIRCLE"):
+        layer = c.dxf.get("layer", "")
+        if layer != ENGINES_LAYER:
+            continue
+        ctr = c.dxf.center
+        color_key, color_rgb = _resolve_color(c, doc)
+        engine_entries.append({
+            "center": (ctr[0], ctr[1]),
+            "radius": float(c.dxf.radius),
+            "color_key": color_key,
+            "color_rgb": color_rgb,
+        })
+
+    # Engines belong to the train whose color matches. If an engine's color
+    # doesn't match any existing train, register a new train for it (this can
+    # happen when an engine color has no hatched module, though in practice
+    # every engine color also appears as a hatch color in the sample files).
+    for eng in engine_entries:
+        trains.get_or_create(eng["color_key"], eng["color_rgb"])
+
+    # --- assign human-readable labels to trains ---
+    # Each train-label MTEXT (e.g. "TL1", "LD3") sits near one of the trains.
+    # We match labels to trains greedily: deduplicate the label texts, then for
+    # each unique label find the nearest module whose train hasn't been named
+    # yet. This avoids two labels collapsing onto the same train when they're
+    # clustered near modules of one color.
+    labeled_trains: set[str] = set()
+    seen_texts: set[str] = set()
+    for tl in train_label_points:
+        if tl["text"] in seen_texts:
+            continue
+        seen_texts.add(tl["text"])
+        pt = Point(tl["point"])
+        best_idx = None
+        best_dist = None
+        for idx, o in enumerate(outlines):
+            if idx not in outline_hatch:
+                continue
+            train_id = outline_hatch[idx]["color_key"]
+            if train_id in labeled_trains:
+                continue
+            d = pt.distance(Point(o["centroid"]))
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_idx = idx
+        if best_idx is not None:
+            train_id = outline_hatch[best_idx]["color_key"]
+            trains.try_assign_label(train_id, tl["text"])
+            labeled_trains.add(train_id)
+            continue
+        # fall back to nearest unlabelled engine
+        best_eng = None
+        best_eng_d = None
+        for eng in engine_entries:
+            if eng["color_key"] in labeled_trains:
+                continue
+            d = pt.distance(Point(eng["center"]))
+            if best_eng_d is None or d < best_eng_d:
+                best_eng_d = d
+                best_eng = eng
+        if best_eng is not None:
+            trains.try_assign_label(best_eng["color_key"], tl["text"])
+            labeled_trains.add(best_eng["color_key"])
 
     # --- build modules: only outlines with a matched hatch count as modules ---
     modules: list[Module] = []
@@ -322,45 +505,78 @@ def load_cassette(filepath: str, name: str) -> CassetteModel:
         if hatch is None:
             continue
         shape = classify_shape(o["points"])
+        train = trains.get_or_create(hatch["color_key"], hatch["color_rgb"])
 
-        # find the label whose insertion point falls inside this module
+        # find the module label whose insertion point falls inside this module
         label_text = ""
+        code = ""
+        uv: tuple[int, int] | None = None
         best_label_dist = None
-        for lab in labels:
+        for lab in module_labels:
             pt = Point(lab["point"])
             if o["polygon"].contains(pt):
                 label_text = lab["text"]
+                code, uv = _parse_module_label(lab["text"])
                 break
             dist = pt.distance(Point(o["centroid"]))
             if best_label_dist is None or dist < best_label_dist:
                 if o["polygon"].distance(pt) < max(o["polygon"].length * 0.05, 1e-6):
                     best_label_dist = dist
                     label_text = lab["text"]
+                    code, uv = _parse_module_label(lab["text"])
 
         modules.append(
             Module(
                 id=f"module-{idx}",
                 polygon=o["points"],
                 shape=shape,
+                train_id=train.id,
                 color_key=hatch["color_key"],
                 color_rgb=hatch["color_rgb"],
+                code=code or f"Module {idx + 1}",
+                uv=uv,
                 label=label_text or f"Module {idx + 1}",
                 centroid=o["centroid"],
             )
         )
 
-    all_x = [p[0] for m in modules for p in m.polygon] or [0, 1]
-    all_y = [p[1] for m in modules for p in m.polygon] or [0, 1]
+    # --- build engines ---
+    engines: list[Engine] = []
+    for i, eng in enumerate(engine_entries):
+        train = trains.get_or_create(eng["color_key"], eng["color_rgb"])
+        engines.append(
+            Engine(
+                id=f"engine-{i}",
+                center=eng["center"],
+                radius=eng["radius"],
+                train_id=train.id,
+                color_key=eng["color_key"],
+                color_rgb=eng["color_rgb"],
+            )
+        )
+
+    all_x = [p[0] for m in modules for p in m.polygon] + [e.center[0] for e in engines]
+    all_y = [p[1] for m in modules for p in m.polygon] + [e.center[1] for e in engines]
+    if not all_x:
+        all_x = [0, 1]
+    if not all_y:
+        all_y = [0, 1]
     bounds = (min(all_x), min(all_y), max(all_x), max(all_y))
 
-    return CassetteModel(name=name, modules=modules, bounds=bounds)
+    return CassetteModel(
+        name=name,
+        modules=modules,
+        engines=engines,
+        trains=trains.all(),
+        bounds=bounds,
+    )
 
 
 def summarize(model: CassetteModel) -> CassetteSummary:
     full_hex = sum(1 for m in model.modules if m.shape == "hex_full")
     partial_hex = sum(1 for m in model.modules if m.shape == "hex_partial")
     tile = sum(1 for m in model.modules if m.shape == "tile")
-    trains = len({m.color_key for m in model.modules})
+    trains = len(model.trains)
     cassette_type = "Mixed" if tile > 0 else "Pure silicon"
     return CassetteSummary(
         cassette_type=cassette_type,
@@ -368,4 +584,5 @@ def summarize(model: CassetteModel) -> CassetteSummary:
         partial_hex=partial_hex,
         tile=tile,
         trains=trains,
+        engines=len(model.engines),
     )

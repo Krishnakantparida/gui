@@ -1,12 +1,14 @@
 """NiceGUI GUI for the HGCAL single-cassette DXF tester.
 
-Loads a cassette DXF, classifies its module footprints (hexagonal /
-partial-hexagonal / tile) and their "train" colors, shows a summary table,
-and renders an interactive SVG of the cassette where hovering a module
-region reveals its MTEXT label in a small tooltip box.
+Enter a cassette name (the .dxf filename without extension) to load its
+layout: module footprints are classified (hexagonal / partial-hexagonal /
+tile) and grouped into "trains" by their fill color, and engines (the
+red circles on the ENGINES layer) are rendered alongside them. A
+checkbox legend lets you toggle the visibility of each train (and the
+engines) in the interactive SVG. Hovering a module or engine reveals a
+tooltip with its details.
 """
 
-import os
 from pathlib import Path
 
 from nicegui import ui, app
@@ -15,13 +17,6 @@ from dxf_model import load_cassette, summarize
 from svg_builder import build_svg
 
 CASSETTE_DIR = Path(__file__).parent / "cassette_layouts"
-SELECT_DEFAULT = "Enter Cassette Name"
-
-SHAPE_LABELS = {
-    "hex_full": "Full hexagonal modules",
-    "hex_partial": "Partial hexagonal modules",
-    "tile": "Tile modules",
-}
 
 
 def discover_cassettes() -> list[str]:
@@ -49,6 +44,23 @@ ui.add_css("""
            color: white !important;
         }
     }
+    .legend-row { gap: 6px; }
+    .legend-swatch {
+        width: 18px; height: 18px; border-radius: 4px;
+        border: 1px solid rgba(148,163,184,0.5);
+        flex-shrink: 0;
+    }
+    .legend-swatch.engine {
+        border-radius: 50%;
+    }
+    .cassette-svg-wrap svg {
+        max-width: 100%; max-height: 100%;
+    }
+    .module-shape, .module-label, .module-hit,
+    .engine-shape, .engine-hit {
+        transition: opacity 0.2s ease;
+    }
+    .dimmed { opacity: 0.12 !important; }
 """)
 
 # One set of hover-tooltip helpers shared by every rendered SVG. Positioning
@@ -83,20 +95,34 @@ ui.add_head_html(
         if (!tip) return;
         tip.style.display = 'none';
     }
+    // Toggle visibility of every SVG element belonging to a train. When a
+    // train is unchecked, its modules/engines/labels are dimmed (not
+    // removed) so the layout stays stable and re-toggling is instant.
+    function setTrainVisible(trainId, visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        const sel = `[data-train="${CSS.escape(trainId)}"]`;
+        svg.querySelectorAll(sel).forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
     </script>
     """
 )
+
 dark_mode = ui.dark_mode()
 dark_mode.enable()  # start in dark mode
+
 with ui.row().classes("w-full items-center justify-between"):
-    # Title section
     with ui.column():
         ui.label("High Granularity Calorimeter (CE-H)").style(
             "font-size:24px;font-weight:bold;"
         )
-        ui.label("Single Cassette Tester").style("font-size:24px;font-weight:bold;")
+        ui.label("Single Cassette Tester").style(
+            "font-size:24px;font-weight:bold;"
+        )
 
-    # Top-right dropdown menu section
     with ui.button(icon="menu").props("flat round"):
         with ui.menu().props('trigger="hover"'):
             with ui.menu_item(auto_close=False):
@@ -123,43 +149,47 @@ with ui.row().classes("w-full items-center justify-between"):
 
 ui.separator()
 
+# state shared between the input handler and the legend
+state = {
+    "model": None,         # last loaded CassetteModel
+    "visible_trains": {},   # train_id -> bool
+    "engines_visible": True,
+}
+
 with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
     # ============================================================
-    # LEFT COLUMN - Cassette Selection + summary table
+    # LEFT COLUMN - Cassette entry + summary + legend
     # ============================================================
     with ui.column().classes("flex-1 gap-3"):
         ui.markdown("## Cassette Information")
 
-        cassette_options = [SELECT_DEFAULT] + discover_cassettes()
-        cassette_select = ui.select(
-            options=cassette_options,
-            value=SELECT_DEFAULT,
-            label="Cassette:",
-        ).classes("w-full")
+        available = discover_cassettes()
+        placeholder = "e.g. Cassette_7B_33B"
+        if available:
+            placeholder = f"e.g. {available[0]}"
+        cassette_input = ui.input(
+            label="Cassette name:",
+            placeholder=placeholder,
+        ).classes("w-full").tooltip("Enter the .dxf filename without extension")
 
         summary_table = (
             ui.table(
                 columns=[
-                    {
-                        "name": "field",
-                        "label": "Field",
-                        "field": "field",
-                        "align": "left",
-                    },
-                    {
-                        "name": "value",
-                        "label": "Value",
-                        "field": "value",
-                        "align": "left",
-                    },
+                    {"name": "field", "label": "Field", "field": "field", "align": "left"},
+                    {"name": "value", "label": "Value", "field": "value", "align": "left"},
                 ],
                 rows=[],
                 row_key="field",
-                column_defaults={"headerClasses": "hidden"},
             )
             .classes("w-full")
             .props("flat bordered hide-header")
         )
+
+        ui.markdown("### Legend")
+        legend_hint = ui.label("Load a cassette to see trains.").classes(
+            "text-sm text-gray-400"
+        )
+        legend_container = ui.column().classes("w-full gap-1")
 
     # ============================================================
     # RIGHT COLUMN - Interactive cassette display
@@ -169,32 +199,96 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
             ui.column()
             .classes("w-full h-full border rounded-lg relative overflow-hidden")
             .props('id="cassette-display-area"')
-            .style(
-                "position: relative; background: rgba(255,255,255,0.02);"
-            ) as display_wrapper
+            .style("position: relative; background: rgba(255,255,255,0.02);")
         ):
             svg_slot = ui.element("div").classes(
-                "w-full h-full flex items-center justify-center"
+                "cassette-svg-wrap w-full h-full flex items-center justify-center"
             )
             ui.element("div").props('id="cassette-tooltip"').classes(
                 "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
             ).style(
                 "display:none; position:absolute; z-index:50; pointer-events:none; "
                 "background: rgba(15, 23, 42, 0.95); border-color: rgba(148,163,184,0.4); "
-                "color: #f1f5f9; max-width: 220px;"
+                "color: #f1f5f9; max-width: 260px;"
             )
 
 
-def load_selected(e) -> None:
+def _render_legend(model) -> None:
+    """Build the checkbox legend from the model's trains and engines."""
+    legend_hint.set_text("Tick a train to show it; untick to hide it.")
+    legend_container.clear()
+    with legend_container:
+        for t in model.trains:
+            r, g, b = t.color_rgb
+            swatch = f"rgb({r},{g},{b})"
+            with ui.row().classes("legend-row w-full items-center"):
+                cb = ui.checkbox(
+                    label=t.label,
+                    value=True,
+                    on_change=lambda e, tid=t.id: _on_train_toggle(tid, e.value),
+                ).classes("flex-1")
+                cb.tooltip(f"Color: rgb({r}, {g}, {b})  |  Train ID: {t.id}")
+                ui.element("div").classes("legend-swatch").style(
+                    f"background:{swatch};"
+                )
+        if model.engines:
+            ui.separator().classes("w-full")
+            with ui.row().classes("legend-row w-full items-center"):
+                e0 = model.engines[0]
+                r, g, b = e0.color_rgb
+                swatch = f"rgb({r},{g},{b})"
+                ui.checkbox(
+                    label="Engines",
+                    value=True,
+                    on_change=lambda e: _on_engines_toggle(e.value),
+                ).classes("flex-1").tooltip("Red circles on the ENGINES layer")
+                ui.element("div").classes("legend-swatch engine").style(
+                    f"background:{swatch};"
+                )
+
+
+def _on_train_toggle(train_id: str, visible: bool) -> None:
+    state["visible_trains"][train_id] = visible
+    ui.run_javascript(
+        f'setTrainVisible({train_id!r}, {"true" if visible else "false"});'
+    )
+
+
+def _on_engines_toggle(visible: bool) -> None:
+    state["engines_visible"] = visible
+    model = state["model"]
+    if model is None:
+        return
+    # engines may belong to one or more trains; toggle each
+    engine_train_ids = {e.train_id for e in model.engines}
+    for tid in engine_train_ids:
+        ui.run_javascript(
+            f'setTrainVisible({tid!r}, {"true" if visible else "false"});'
+        )
+
+
+def load_selected(name: str) -> None:
     svg_slot.clear()
     summary_table.rows = []
     summary_table.update()
+    legend_container.clear()
+    legend_hint.set_text("Load a cassette to see trains.")
 
-    name = e.value
-    if not name or name == SELECT_DEFAULT:
+    if not name:
         return
 
     filepath = CASSETTE_DIR / f"{name}.dxf"
+    if not filepath.exists():
+        with svg_slot:
+            ui.label(
+                f"No file named '{name}.dxf' in cassette_layouts/."
+            ).classes("text-red-400")
+        if available:
+            legend_hint.set_text(
+                f"Available: {', '.join(available)}"
+            )
+        return
+
     try:
         model = load_cassette(str(filepath), name)
     except Exception as ex:
@@ -202,15 +296,23 @@ def load_selected(e) -> None:
             ui.label(f"Failed to load {name}: {ex}").classes("text-red-400")
         return
 
+    state["model"] = model
+    state["visible_trains"] = {t.id: True for t in model.trains}
+    state["engines_visible"] = True
+
     summary = summarize(model)
     summary_table.rows = [
+        {"field": "Cassette", "value": name},
         {"field": "Cassette Type", "value": summary.cassette_type},
         {"field": "Full Hex Modules", "value": summary.full_hex},
         {"field": "Partial Hex Modules", "value": summary.partial_hex},
         {"field": "Tile Modules", "value": summary.tile},
         {"field": "Trains", "value": summary.trains},
+        {"field": "Engines", "value": summary.engines},
     ]
     summary_table.update()
+
+    _render_legend(model)
 
     svg_content = build_svg(model)
     with svg_slot:
@@ -220,7 +322,7 @@ def load_selected(e) -> None:
         ui.html(svg_content, sanitize=False).classes("w-full h-full")
 
 
-cassette_select.on_value_change(load_selected)
+cassette_input.on_value_change(lambda e: load_selected(e.value))
 
 ui.run(
     title="[HGCAL] Single Cassette Tester",
