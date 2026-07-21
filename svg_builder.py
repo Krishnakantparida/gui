@@ -30,6 +30,9 @@ SHAPE_LABEL = {
     "tile": "Tile",
 }
 
+PASS_FILL = "#22c55e"
+FAIL_FILL = "#ef4444"
+
 
 def _module_tooltip(m: Module, train_label: str) -> str:
     """Tooltip text for a module: everything NOT already drawn on the shape."""
@@ -167,6 +170,107 @@ def build_svg(model: CassetteModel) -> str:
             f'onmouseenter="cassetteHover(event, {tooltip_text})" '
             f'onmousemove="cassetteMove(event)" '
             f'onmouseleave="cassetteLeave(event)"></circle>'
+        )
+
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _test_module_tooltip(m: Module, passed: bool) -> str:
+    """Tooltip text for a module in the test-results view."""
+    lines = [f"Code: {m.code}"]
+    if m.uv is not None:
+        lines.append(f"(u, v): ({m.uv[0]}, {m.uv[1]})")
+    lines.append(f"Shape: {SHAPE_LABEL.get(m.shape, m.shape)}")
+    lines.append(f"Test: {'Pass' if passed else 'Fail'}")
+    lines.append(f"Reason: N/A")
+    return "\n".join(lines)
+
+
+def build_test_svg(model: CassetteModel, results: dict[str, bool]) -> str:
+    """Build an interactive SVG showing per-module test results.
+
+    ``results`` maps ``Module.id`` -> pass/fail (True = pass). Modules are
+    colored green (pass) or red (fail); engines are omitted. Each module's
+    ``data-status`` attribute ("pass"/"fail") drives the legend's checkbox
+    toggling via the shared ``setTrainVisible`` JS helper.
+    """
+    minx, miny, maxx, maxy = model.bounds
+    w = max(maxx - minx, 1e-6)
+    h = max(maxy - miny, 1e-6)
+    pad_x = w * PADDING_RATIO
+    pad_y = h * PADDING_RATIO
+
+    view_minx = minx - pad_x
+    view_miny = miny - pad_y
+    view_w = w + 2 * pad_x
+    view_h = h + 2 * pad_y
+
+    def tx(x: float) -> float:
+        return x - view_minx
+
+    def ty(y: float) -> float:
+        return view_h - (y - view_miny)
+
+    def pts_str(points: list[tuple[float, float]]) -> str:
+        return " ".join(f"{tx(x):.2f},{ty(y):.2f}" for x, y in points)
+
+    parts: list[str] = []
+    parts.append(
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {view_w:.2f} {view_h:.2f}" '
+        f'preserveAspectRatio="xMidYMid meet" style="width:100%;height:100%;display:block;">'
+    )
+
+    if not model.modules:
+        parts.append(
+            f'<text x="{view_w / 2:.2f}" y="{view_h / 2:.2f}" text-anchor="middle" '
+            f'fill="#94a3b8" font-size="{max(view_w, view_h) * 0.04:.2f}">No module regions detected</text>'
+        )
+        parts.append("</svg>")
+        return "".join(parts)
+
+    stroke_width = max(view_w, view_h) * 0.0035
+    font_size = max(view_w, view_h) * 0.022
+
+    for m in model.modules:
+        points = pts_str(m.polygon)
+        passed = bool(results.get(m.id, True))
+        fill = PASS_FILL if passed else FAIL_FILL
+        status = "pass" if passed else "fail"
+        tooltip_json = json.dumps(_test_module_tooltip(m, passed))
+        tooltip_text = html.escape(tooltip_json, quote=True)
+        data_status = html.escape(status, quote=True)
+
+        parts.append(
+            f'<polygon points="{points}" fill="{fill}" fill-opacity="0.82" '
+            f'stroke="#e2e8f0" stroke-width="{stroke_width:.3f}" '
+            f'class="module-shape" data-shape="{html.escape(m.shape)}" '
+            f'data-train="{data_status}"></polygon>'
+        )
+        cx, cy = m.centroid
+        sx, sy = tx(cx), ty(cy)
+        label_lines = [m.code]
+        if m.uv is not None:
+            label_lines.append(f"({m.uv[0]},{m.uv[1]})")
+        parts.append(
+            f'<text x="{sx:.2f}" y="{sy:.2f}" text-anchor="middle" '
+            f'dominant-baseline="central" fill="#f8fafc" '
+            f'font-size="{font_size:.2f}" font-family="monospace" '
+            f'font-weight="600" pointer-events="none" '
+            f'class="module-label" data-train="{data_status}">'
+            + "".join(
+                f'<tspan x="{sx:.2f}" dy="{i * 1.1:.2f}em">{html.escape(ln)}</tspan>'
+                for i, ln in enumerate(label_lines)
+            )
+            + "</text>"
+        )
+        parts.append(
+            f'<polygon points="{points}" fill="transparent" stroke="none" '
+            f'class="module-hit" style="cursor:pointer;" '
+            f'data-train="{data_status}" '
+            f'onmouseenter="cassetteHover(event, {tooltip_text})" '
+            f'onmousemove="cassetteMove(event)" '
+            f'onmouseleave="cassetteLeave(event)"></polygon>'
         )
 
     parts.append("</svg>")
