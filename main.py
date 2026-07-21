@@ -366,6 +366,13 @@ def load_selected(name: str) -> None:
 
 cassette_input.on_value_change(lambda e: load_selected(e.value))
 
+# Control Buttons
+with ui.row().classes("w-1/4 gap-2"):
+    run_button = ui.button(
+        "▶ Run Cassette Test",
+        on_click=run_tests,
+    ).classes("green-background flex-1")
+
 ui.run(
     title="[HGCAL] Single Cassette Tester",
 )
