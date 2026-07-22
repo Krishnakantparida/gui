@@ -301,9 +301,9 @@ def _render_legend(model) -> None:
     """Build the checkbox legend from the model's trains and engines."""
     legend_container.clear()
     with legend_container:
-        #ui.label("Tick a train to show it; untick to hide it.").classes(
-        #    "text-sm text-gray-400"
-        #)
+        ui.label("Trains").classes(
+            "text-sm text-gray-400"
+        )
         for t in model.trains:
             r, g, b = t.color_rgb
             swatch = f"rgb({r},{g},{b})"
