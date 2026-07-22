@@ -489,6 +489,18 @@ async def run_tests() -> None:
     run_button.update()
 
 
+# ============================================================
+# Control Buttons -- created AFTER run_tests is defined so we can pass
+# it directly (NiceGUI awaits coroutine-function handlers; a lambda
+# wrapping a coroutine would NOT be awaited and the test would never run).
+# ============================================================
+with ui.row().classes("w-1/4 gap-2"):
+    run_button = ui.button(
+        "▶ Run Cassette Test",
+        on_click=run_tests,
+    ).classes("green-background flex-1").props("disabled")
+
+
 def load_selected(name: str) -> None:
     svg_slot.clear()
     summary_table.rows = []
@@ -556,15 +568,9 @@ def load_selected(name: str) -> None:
     run_button.props("disabled=false")
 
 
-# Control Buttons
-with ui.row().classes("w-1/4 gap-2"):
-    run_button = ui.button(
-        "▶ Run Cassette Test",
-        on_click=run_tests,
-    ).classes("green-background flex-1").props("disabled")
-
-# Register the input callback AFTER run_button exists so load_selected can
-# safely access run_button even if on_value_change fires on initial load.
+# Register the input callback last, after run_button and all handler
+# functions exist, so load_selected can safely access run_button even if
+# on_value_change fires during page setup.
 cassette_input.on_value_change(lambda e: load_selected(e.value))
 
 ui.run(
