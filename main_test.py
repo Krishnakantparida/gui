@@ -448,16 +448,25 @@ async def run_tests() -> None:
 
     state["test_in_progress"] = True
     run_button.props("disabled")
+    run_button.update()
 
     # show the progress overlay and reset the bar
     progress_container.style("display:flex;")
+    progress_container.update()
     progress_bar.value = 0.0
+    progress_bar.update()
     progress_label.text = "Running cassette test..."
+    progress_label.update()
 
     # simulate test work with incremental progress
     for pct in range(0, 101, 5):
         progress_bar.value = pct / 100.0
+        progress_bar.update()
         await ui.sleep(0.05)
+
+    progress_label.text = "Test complete!"
+    progress_label.update()
+    await ui.sleep(0.2)
 
     # classify ~5% of modules as failed, rest pass
     module_ids = [m.id for m in model.modules]
@@ -468,6 +477,7 @@ async def run_tests() -> None:
 
     # hide the progress overlay
     progress_container.style("display:none;")
+    progress_container.update()
 
     # switch to the test-results view
     state["view_mode"] = "test"
@@ -476,6 +486,7 @@ async def run_tests() -> None:
 
     state["test_in_progress"] = False
     run_button.props("disabled=false")
+    run_button.update()
 
 
 def load_selected(name: str) -> None:
@@ -545,14 +556,16 @@ def load_selected(name: str) -> None:
     run_button.props("disabled=false")
 
 
-cassette_input.on_value_change(lambda e: load_selected(e.value))
-
 # Control Buttons
 with ui.row().classes("w-1/4 gap-2"):
     run_button = ui.button(
         "▶ Run Cassette Test",
         on_click=run_tests,
     ).classes("green-background flex-1").props("disabled")
+
+# Register the input callback AFTER run_button exists so load_selected can
+# safely access run_button even if on_value_change fires on initial load.
+cassette_input.on_value_change(lambda e: load_selected(e.value))
 
 ui.run(
     title="[HGCAL] Single Cassette Tester",
