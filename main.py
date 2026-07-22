@@ -483,12 +483,13 @@ def load_selected(name: str) -> None:
             "text-sm text-gray-400"
         )
 
-    # reset test/view state on every (re)load
+    # reset test/view state on every (re)load; keep the run button
+    # disabled until a cassette is fully loaded (table + display done)
     state["test_results"] = {}
     state["view_mode"] = "trains"
     state["test_in_progress"] = False
     progress_container.style("display:none;")
-    run_button.props("disabled=false")
+    run_button.props("disabled")
     _update_toggle_buttons()
 
     if not name:
@@ -533,6 +534,10 @@ def load_selected(name: str) -> None:
     _render_view()
     _update_toggle_buttons()
 
+    # cassette is fully loaded (table + display populated) -- enable the
+    # run button so a test can be executed for this cassette.
+    run_button.props("disabled=false")
+
 
 cassette_input.on_value_change(lambda e: load_selected(e.value))
 
@@ -541,7 +546,7 @@ with ui.row().classes("w-1/4 gap-2"):
     run_button = ui.button(
         "▶ Run Cassette Test",
         on_click=run_tests,
-    ).classes("green-background flex-1")
+    ).classes("green-background flex-1").props("disabled")
 
 ui.run(
     title="[HGCAL] Single Cassette Tester",
