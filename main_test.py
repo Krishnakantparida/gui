@@ -301,7 +301,7 @@ def _render_legend(model) -> None:
     """Build the checkbox legend from the model's trains and engines."""
     legend_container.clear()
     with legend_container:
-        ui.label("Trains").classes(
+        ui.label("Trains and Engines").classes(
             "text-sm text-gray-400"
         )
         for t in model.trains:
