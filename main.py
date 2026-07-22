@@ -8,20 +8,14 @@ checkbox legend -- overlaid in the top-left corner of the cassette
 display -- lets you toggle the visibility of each train (and the
 engines) in the interactive SVG. Hovering a module or engine reveals a
 tooltip with its details.
-
-Running a cassette test produces a second interactive display showing
-per-module Pass/Fail results (green/red); arrow buttons in the top-right
-corner of the display region toggle between the trains view and the
-test-results view.
 """
 
-import random
 from pathlib import Path
 
 from nicegui import ui, app
 
 from dxf_model import load_cassette, summarize
-from svg_builder import build_svg, build_test_svg
+from svg_builder import build_svg
 
 CASSETTE_DIR = Path(__file__).parent / "cassette_layouts"
 CMS_LOGO = Path(__file__).parent / "standard_images" / "CMS_logo-002.png"
@@ -92,25 +86,6 @@ ui.add_css("""
     .legend-overlay .q-checkbox { min-height: 0; padding: 0; }
     .legend-overlay .q-checkbox__inner { width: 22px; height: 22px; }
     .legend-overlay .legend-row { gap: 4px; }
-    /* View-toggle arrow buttons pinned to the top-right of the display. */
-    .view-toggle {
-        position: absolute;
-        top: 5px;
-        right: 5px;
-        z-index: 40;
-        gap: 2px;
-    }
-    .view-toggle .q-btn { min-height: 0; padding: 2px 4px; }
-    .view-toggle .q-btn .q-icon { font-size: 18px; }
-    /* Progress-bar overlay shown while a test is running. */
-    .progress-overlay {
-        position: absolute;
-        top: 50%; left: 50%;
-        transform: translate(-50%, -50%);
-        z-index: 45;
-        width: 60%;
-        text-align: center;
-    }
 """)
 
 # One set of hover-tooltip helpers shared by every rendered SVG. Positioning
@@ -209,14 +184,11 @@ with ui.row().classes("w-full items-center justify-between no-wrap"):
 
 ui.separator()
 
-# state shared between the input handler, the legend, and the test workflow
+# state shared between the input handler and the legend
 state = {
     "model": None,            # last loaded CassetteModel
-    "visible_trains": {},      # train_id -> bool (trains view)
+    "visible_trains": {},      # train_id -> bool
     "engines_visible": True,
-    "test_results": {},        # module.id -> bool (True = pass)
-    "view_mode": "trains",     # "trains" | "test"
-    "test_in_progress": False,
 }
 
 with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
@@ -268,26 +240,6 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
                     "text-sm text-gray-400"
                 )
 
-            # View-toggle arrow buttons pinned to the top-right corner. Hidden
-            # until a test has produced results to toggle between.
-            with ui.row().classes("view-toggle items-center") as toggle_container:
-                toggle_left = ui.button(icon="arrow_back").props(
-                    "flat round dense color=blue-grey-4"
-                ).props("disabled").tooltip("Show trains view")
-                toggle_right = ui.button(icon="arrow_forward").props(
-                    "flat round dense color=blue-grey-4"
-                ).props("disabled").tooltip("Show test-results view")
-
-            # Progress-bar overlay shown while a test is running.
-            with ui.column().classes("progress-overlay") as progress_container:
-                progress_label = ui.label("Running cassette test...").classes(
-                    "text-sm text-gray-200 mb-2"
-                )
-                progress_bar = ui.linear_progress(value=0).props(
-                    "color=green-6 rounded"
-                ).classes("w-full")
-            progress_container.style("display:none;")
-
             ui.element("div").props('id="cassette-tooltip"').classes(
                 "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
             ).style(
@@ -333,29 +285,6 @@ def _render_legend(model) -> None:
                 )
 
 
-def _render_test_legend(model, results) -> None:
-    """Build the checkbox legend for the test-results view."""
-    legend_container.clear()
-    with legend_container:
-        ui.label("Tick a status to show it; untick to hide it.").classes(
-            "text-sm text-gray-400"
-        )
-        with ui.row().classes("legend-row w-full items-center"):
-            ui.checkbox(
-                text="Passed",
-                value=True,
-                on_change=lambda e: _on_test_toggle("pass", e.value),
-            ).classes("flex-1").tooltip("Modules that passed the test")
-            ui.element("div").classes("legend-swatch").style("background:#22c55e;")
-        with ui.row().classes("legend-row w-full items-center"):
-            ui.checkbox(
-                text="Failed",
-                value=True,
-                on_change=lambda e: _on_test_toggle("fail", e.value),
-            ).classes("flex-1").tooltip("Modules that failed the test")
-            ui.element("div").classes("legend-swatch").style("background:#ef4444;")
-
-
 def _on_train_toggle(train_id: str, visible: bool) -> None:
     state["visible_trains"][train_id] = visible
     ui.run_javascript(
@@ -376,101 +305,19 @@ def _on_engines_toggle(visible: bool) -> None:
         )
 
 
-def _on_test_toggle(status: str, visible: bool) -> None:
-    ui.run_javascript(
-        f'setTrainVisible({status!r}, {"true" if visible else "false"});'
-    )
-
-
 def _render_view() -> None:
-    """Render the SVG for the current view_mode into svg_slot."""
+    """Render the SVG for the current model into svg_slot."""
     model = state["model"]
     if model is None:
         return
     svg_slot.clear()
-    if state["view_mode"] == "test":
-        svg_content = build_test_svg(model, state["test_results"])
-        _render_test_legend(model, state["test_results"])
-    else:
-        svg_content = build_svg(model)
-        _render_legend(model)
+    svg_content = build_svg(model)
+    _render_legend(model)
     with svg_slot:
         # sanitize=False: the SVG is our own trusted output (not user input) and
         # relies on inline onmouse* handlers for hover tooltips, which NiceGUI's
         # default DOMPurify sanitization strips.
         ui.html(svg_content, sanitize=False).classes("w-full h-full")
-
-
-def _update_toggle_buttons() -> None:
-    has_results = bool(state["test_results"])
-    if not has_results:
-        toggle_left.props("disabled")
-        toggle_right.props("disabled")
-        return
-    if state["view_mode"] == "test":
-        toggle_left.props("disabled=false")
-        toggle_right.props("disabled")
-    else:  # trains
-        toggle_left.props("disabled")
-        toggle_right.props("disabled=false")
-
-
-def _on_toggle_left() -> None:
-    if state["view_mode"] != "test":
-        return
-    state["view_mode"] = "trains"
-    _render_view()
-    _update_toggle_buttons()
-
-
-def _on_toggle_right() -> None:
-    if state["view_mode"] != "trains" or not state["test_results"]:
-        return
-    state["view_mode"] = "test"
-    _render_view()
-    _update_toggle_buttons()
-
-
-toggle_left.on_click(_on_toggle_left)
-toggle_right.on_click(_on_toggle_right)
-
-
-async def run_tests() -> None:
-    """Run a (simulated) cassette test and display per-module results."""
-    model = state["model"]
-    if model is None or state["test_in_progress"]:
-        return
-
-    state["test_in_progress"] = True
-    run_button.props("disabled")
-
-    # show the progress overlay and reset the bar
-    progress_container.style("display:flex;")
-    progress_bar.value = 0.0
-    progress_label.text = "Running cassette test..."
-
-    # simulate test work with incremental progress
-    for pct in range(0, 101, 5):
-        progress_bar.value = pct / 100.0
-        await ui.sleep(0.05)
-
-    # classify ~5% of modules as failed, rest pass
-    module_ids = [m.id for m in model.modules]
-    fail_count = max(1, round(len(module_ids) * 0.05)) if module_ids else 0
-    failed = set(random.sample(module_ids, fail_count)) if module_ids else set()
-    results = {mid: (mid not in failed) for mid in module_ids}
-    state["test_results"] = results
-
-    # hide the progress overlay
-    progress_container.style("display:none;")
-
-    # switch to the test-results view
-    state["view_mode"] = "test"
-    _render_view()
-    _update_toggle_buttons()
-
-    state["test_in_progress"] = False
-    run_button.props("disabled=false")
 
 
 def load_selected(name: str) -> None:
@@ -483,14 +330,7 @@ def load_selected(name: str) -> None:
             "text-sm text-gray-400"
         )
 
-    # reset test/view state on every (re)load; keep the run button
-    # disabled until a cassette is fully loaded (table + display done)
-    state["test_results"] = {}
-    state["view_mode"] = "trains"
-    state["test_in_progress"] = False
-    progress_container.style("display:none;")
-    run_button.props("disabled")
-    _update_toggle_buttons()
+    state["model"] = None
 
     if not name:
         return
@@ -532,11 +372,6 @@ def load_selected(name: str) -> None:
     summary_table.update()
 
     _render_view()
-    _update_toggle_buttons()
-
-    # cassette is fully loaded (table + display populated) -- enable the
-    # run button so a test can be executed for this cassette.
-    run_button.props("disabled=false")
 
 
 cassette_input.on_value_change(lambda e: load_selected(e.value))
@@ -545,8 +380,8 @@ cassette_input.on_value_change(lambda e: load_selected(e.value))
 with ui.row().classes("w-1/4 gap-2"):
     run_button = ui.button(
         "▶ Run Cassette Test",
-        on_click=run_tests,
-    ).classes("green-background flex-1").props("disabled")
+        on_click=lambda: None,
+    ).classes("green-background flex-1")
 
 ui.run(
     title="[HGCAL] Single Cassette Tester",
