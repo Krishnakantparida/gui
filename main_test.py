@@ -494,11 +494,7 @@ async def run_tests() -> None:
 # it directly (NiceGUI awaits coroutine-function handlers; a lambda
 # wrapping a coroutine would NOT be awaited and the test would never run).
 # ============================================================
-with ui.row().classes("w-1/4 gap-2"):
-    run_button = ui.button(
-        "▶ Run Cassette Test",
-        on_click=run_tests,
-    ).classes("green-background flex-1").props("disabled")
+
 
 
 def load_selected(name: str) -> None:
@@ -518,7 +514,7 @@ def load_selected(name: str) -> None:
     state["view_mode"] = "trains"
     state["test_in_progress"] = False
     progress_container.style("display:none;")
-    run_button.props("disabled")
+    #run_button.props("disabled")
     _update_toggle_buttons()
 
     if not name:
@@ -565,7 +561,11 @@ def load_selected(name: str) -> None:
 
     # cassette is fully loaded (table + display populated) -- enable the
     # run button so a test can be executed for this cassette.
-    run_button.props("disabled=false")
+    with ui.row().classes("w-1/2 gap-2"):
+        run_button = ui.button(
+            "▶ Run Cassette Test",
+            on_click=run_tests,
+        ).classes("green-background flex-1").props("disabled")
 
 
 # Register the input callback last, after run_button and all handler
