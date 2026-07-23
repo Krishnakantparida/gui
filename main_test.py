@@ -82,8 +82,8 @@ ui.add_css("""
         overflow-y: auto;
         padding: 7px 8px;
         border-radius: 5px;
-        border: 1px solid rgba(148,163,184,0.35);
-        background: rgba(15, 23, 42, 0.82);
+        border: 1px solid rgba(100, 116, 139, 0.35);
+        background: rgba(241, 245, 249, 0.88);
         backdrop-filter: blur(4px);
     }
     .legend-overlay .q-checkbox__label {
@@ -110,6 +110,49 @@ ui.add_css("""
         z-index: 45;
         width: 60%;
         text-align: center;
+    }
+    /* ---- Theme-aware display components ---- */
+    /* Light mode (default): black strokes, light legend/tooltip */
+    .cassette-svg-wrap .module-shape,
+    .cassette-svg-wrap .engine-shape {
+        stroke: #000000;
+    }
+    .legend-overlay .text-gray-400 {
+        color: #475569 !important;
+    }
+    .progress-overlay .text-gray-200 {
+        color: #0f172a !important;
+    }
+    #cassette-tooltip {
+        background: rgba(241, 245, 249, 0.95);
+        border-color: rgba(100, 116, 139, 0.4);
+        color: #0f172a;
+    }
+    #cassette-display-area {
+        background: rgba(0, 0, 0, 0.02);
+    }
+    /* Dark mode: white strokes, dark legend/tooltip */
+    .cassette-dark .cassette-svg-wrap .module-shape,
+    .cassette-dark .cassette-svg-wrap .engine-shape {
+        stroke: #ffffff;
+    }
+    .cassette-dark .legend-overlay {
+        border-color: rgba(148, 163, 184, 0.35);
+        background: rgba(15, 23, 42, 0.82);
+    }
+    .cassette-dark .legend-overlay .text-gray-400 {
+        color: #94a3b8 !important;
+    }
+    .cassette-dark .progress-overlay .text-gray-200 {
+        color: #e2e8f0 !important;
+    }
+    .cassette-dark #cassette-tooltip {
+        background: rgba(15, 23, 42, 0.95);
+        border-color: rgba(148, 163, 184, 0.4);
+        color: #f1f5f9;
+    }
+    .cassette-dark #cassette-display-area {
+        background: rgba(255, 255, 255, 0.02);
     }
 """)
 
@@ -145,6 +188,8 @@ ui.add_head_html(
         if (!tip) return;
         tip.style.display = 'none';
     }
+    // Apply initial dark-mode class (dark mode is the default on page load).
+    document.body.classList.add("cassette-dark");
     // Toggle visibility of every SVG element belonging to a train. When a
     // train is unchecked, its modules/engines/labels are dimmed (not
     // removed) so the layout stays stable and re-toggling is instant.
@@ -163,6 +208,16 @@ ui.add_head_html(
 
 dark_mode = ui.dark_mode()
 dark_mode.enable()  # start in dark mode
+
+
+def _on_theme_toggle(e):
+    """Toggle dark mode and the cassette display's colour scheme."""
+    if e.value:
+        dark_mode.enable()
+        ui.run_javascript('document.body.classList.add("cassette-dark");')
+    else:
+        dark_mode.disable()
+        ui.run_javascript('document.body.classList.remove("cassette-dark");')
 
 # ============================================================
 # Header: CMS logo + title on the left, menu dropdown on the right
@@ -190,9 +245,7 @@ with ui.row().classes("w-full items-center justify-between no-wrap"):
                     ui.label("Theme").classes("text-sm")
                     ui.switch(
                         value=True,
-                        on_change=lambda e: dark_mode.enable()
-                        if e.value
-                        else dark_mode.disable(),
+                        on_change=_on_theme_toggle,
                     ).props(
                         'checked-icon="dark_mode" unchecked-icon="light_mode" color="blue-grey-7"'
                     ).tooltip("Toggle light / dark mode")
@@ -256,7 +309,7 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
             ui.column()
             .classes("w-full h-full border rounded-lg relative overflow-hidden")
             .props('id="cassette-display-area"')
-            .style("position: relative; background: rgba(255,255,255,0.02);")
+            .style("position: relative;")
         ):
             svg_slot = ui.element("div").classes(
                 "cassette-svg-wrap w-full h-full flex items-center justify-center"
@@ -292,8 +345,7 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
                 "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
             ).style(
                 "display:none; position:absolute; z-index:50; pointer-events:none; "
-                "background: rgba(15, 23, 42, 0.95); border-color: rgba(148,163,184,0.4); "
-                "color: #f1f5f9; max-width: 260px;"
+                "max-width: 260px;"
             )
 
 
