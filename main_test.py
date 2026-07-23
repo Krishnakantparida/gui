@@ -447,8 +447,6 @@ async def run_tests() -> None:
         return
 
     state["test_in_progress"] = True
-    run_button.props("disabled")
-    run_button.update()
 
     # show the progress overlay and reset the bar
     progress_container.style("display:flex;")
@@ -485,8 +483,6 @@ async def run_tests() -> None:
     _update_toggle_buttons()
 
     state["test_in_progress"] = False
-    run_button.props("disabled=false")
-    run_button.update()
 
 
 # ============================================================
@@ -514,7 +510,6 @@ def load_selected(name: str) -> None:
     state["view_mode"] = "trains"
     state["test_in_progress"] = False
     progress_container.style("display:none;")
-    #run_button.props("disabled")
     _update_toggle_buttons()
 
     if not name:
@@ -565,7 +560,7 @@ def load_selected(name: str) -> None:
         run_button = ui.button(
             "▶ Run Cassette Test",
             on_click=run_tests,
-        ).classes("green-background flex-1").props("disabled")
+        ).classes("green-background flex-1")
 
 
 # Register the input callback last, after run_button and all handler
