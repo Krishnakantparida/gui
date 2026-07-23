@@ -17,7 +17,7 @@ test-results view.
 
 import random
 from pathlib import Path
-
+import asyncio
 from nicegui import ui, app
 
 from dxf_model import load_cassette, summarize
@@ -460,11 +460,11 @@ async def run_tests() -> None:
     for pct in range(0, 101, 5):
         progress_bar.value = pct / 100.0
         progress_bar.update()
-        await ui.sleep(0.05)
+        await asyncio.sleep(0.05)
 
     progress_label.text = "Test complete!"
     progress_label.update()
-    await ui.sleep(0.2)
+    await asyncio.sleep(0.2)
 
     # classify ~5% of modules as failed, rest pass
     module_ids = [m.id for m in model.modules]
@@ -490,11 +490,12 @@ async def run_tests() -> None:
 # it directly (NiceGUI awaits coroutine-function handlers; a lambda
 # wrapping a coroutine would NOT be awaited and the test would never run).
 # ============================================================
-
+dynamic_container = ui.row().classes("w-full") 
 
 
 def load_selected(name: str) -> None:
     svg_slot.clear()
+    dynamic_container.clear()
     summary_table.rows = []
     summary_table.update()
     legend_container.clear()
@@ -556,11 +557,12 @@ def load_selected(name: str) -> None:
 
     # cassette is fully loaded (table + display populated) -- enable the
     # run button so a test can be executed for this cassette.
-    with ui.row().classes("w-1/2 gap-2"):
-        run_button = ui.button(
-            "▶ Run Cassette Test",
-            on_click=run_tests,
-        ).classes("green-background flex-1")
+    with dynamic_container:
+        with ui.row().classes("w-1/4 gap-2"):
+            run_button = ui.button(
+                "▶ Run Cassette Test",
+                on_click=run_tests,
+            ).classes("green-background flex-1")
 
 
 # Register the input callback last, after run_button and all handler
