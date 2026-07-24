@@ -1,0 +1,212 @@
+{
+    "44C": {
+        "TL3": {
+            "G8": {
+                "u": 4,
+                "v": 6,
+                "type": "TM-G8RM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "E8": {
+                "u": 3,
+                "v": 6,
+                "type": "TM-E8FM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "D8": {
+                "u": 2,
+                "v": 6,
+                "type": "TM-D8FM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "B12": {
+                "u": 1,
+                "v": 6,
+                "type": "TM-B2FC",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "A6": {
+                "u": 0,
+                "v": 6,
+                "type": "TM-A6FC",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            }
+        },
+        "TL2": {
+            "G8": {
+                "u": 4,
+                "v": 7,
+                "type": "TM-G8FM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "E8": {
+                "u": 3,
+                "v": 7,
+                "type": "TM-E8FM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "D8": {
+                "u": 2,
+                "v": 7,
+                "type": "TM-D8FM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "B12": {
+                "u": 1,
+                "v": 7,
+                "type": "TM-B2FC",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "A5": {
+                "u": 0,
+                "v": 7,
+                "type": "TM-A5FC",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            }
+        },
+        "TL1": {
+            "G8": {
+                "u": 4,
+                "v": 8,
+                "type": "TM-G8LM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "E8": {
+                "u": 3,
+                "v": 8,
+                "type": "TM-E8FM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "D8": {
+                "u": 2,
+                "v": 8,
+                "type": "TM-D8FM",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "B12": {
+                "u": 1,
+                "v": 8,
+                "type": "TM-B2FC",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            },
+            "A6": {
+                "u": 0,
+                "v": 8,
+                "type": "TM-A6FC",
+                "i_rot": 0,
+                "trigLinks": 1,
+                "daqLinks": 1
+            }
+        },
+        "LD2": {
+            "engine": {
+                "u": 4.5,
+                "v": 5.5,
+                "type": "EL10E0"
+            },
+            "wagon_west": "WW11A1",
+            "wagon_east": "WE11A1",
+            "W1": {
+                "u": 4,
+                "v": 5,
+                "type": "ML-F3T",
+                "i_rot": 1,
+                "trigLinks": 2,
+                "daqLinks": 1
+            },
+            "W2": {
+                "u": 3,
+                "v": 4,
+                "type": "ML-T3T",
+                "i_rot": 1,
+                "trigLinks": 2,
+                "daqLinks": 1
+            },
+            "E1": {
+                "u": 5,
+                "v": 6,
+                "type": "ML-F3T",
+                "i_rot": 1,
+                "trigLinks": 2,
+                "daqLinks": 1
+            },
+            "E2": {
+                "u": 6,
+                "v": 7,
+                "type": "ML-B3T",
+                "i_rot": 1,
+                "trigLinks": 2,
+                "daqLinks": 1
+            }
+        },
+        "LD1": {
+            "engine": {
+                "u": 3.5,
+                "v": 5.5,
+                "type": "EL10E0"
+            },
+            "wagon_west": "WW10A1",
+            "wagon_east": "WE30A3",
+            "W1": {
+                "u": 3,
+                "v": 5,
+                "type": "ML-F3T",
+                "i_rot": 1,
+                "trigLinks": 2,
+                "daqLinks": 1
+            },
+            "E1": {
+                "u": 4,
+                "v": 6,
+                "type": "ML-F3T",
+                "i_rot": 1,
+                "trigLinks": 2,
+                "daqLinks": 1
+            },
+            "E2": {
+                "u": 5,
+                "v": 7,
+                "type": "ML-F3T",
+                "i_rot": 1,
+                "trigLinks": 2,
+                "daqLinks": 1
+            },
+            "E3": {
+                "u": 4,
+                "v": 7,
+                "type": "ML-F3T",
+                "i_rot": 5,
+                "trigLinks": 2,
+                "daqLinks": 1
+            }
+        }
+    }
+}
