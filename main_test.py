@@ -63,6 +63,10 @@ ui.add_css("""
     .legend-swatch.engine {
         border-radius: 50%;
     }
+    .legend-swatch.wagon {
+        border-radius: 3px;
+        border-style: dashed;
+    }
     .cassette-svg-wrap svg {
         max-width: 100%; max-height: 100%;
     }
@@ -216,6 +220,14 @@ ui.add_head_html(
             else el.classList.add('dimmed');
         });
     }
+    function setWagonsVisible(visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        svg.querySelectorAll('[data-wagon="true"]').forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
     </script>
     """
 )
@@ -281,6 +293,7 @@ state = {
     "model": None,            # last loaded CassetteModel
     "visible_trains": {},      # train_id -> bool (trains view)
     "engines_visible": True,
+    "wagons_visible": True,
     "test_results": {},        # module.id -> bool (True = pass)
     "view_mode": "trains",     # "trains" | "test"
     "test_in_progress": False,
@@ -399,6 +412,18 @@ def _render_legend(model) -> None:
                 ui.element("div").classes("legend-swatch engine").style(
                     f"background:{swatch};"
                 )
+        has_wagons = any(m.is_wagon for m in model.modules)
+        if has_wagons:
+            ui.separator().classes("w-full")
+            with ui.row().classes("legend-row w-full items-center"):
+                ui.checkbox(
+                    text="Wagons",
+                    value=state["wagons_visible"],
+                    on_change=lambda e: _on_wagons_toggle(e.value),
+                ).classes("flex-1").tooltip("Wagon modules (W/E prefixed, dashed outline)")
+                ui.element("div").classes("legend-swatch wagon").style(
+                    "background:rgba(148,163,184,0.45);border-style:dashed;"
+                )
 
 
 def _render_test_legend(model, results) -> None:
@@ -429,6 +454,12 @@ def _on_train_toggle(train_id: str, visible: bool) -> None:
     ui.run_javascript(
         f'setTrainVisible({train_id!r}, {"true" if visible else "false"});'
     )
+
+
+def _on_wagons_toggle(visible: bool) -> None:
+    state["wagons_visible"] = visible
+    v = "true" if visible else "false"
+    ui.run_javascript(f"setWagonsVisible({v});")
 
 
 def _on_engines_toggle(visible: bool) -> None:
@@ -654,6 +685,7 @@ def load_selected(name: str) -> None:
     state["model"] = model
     state["visible_trains"] = {t.id: True for t in model.trains}
     state["engines_visible"] = True
+    state["wagons_visible"] = True
 
     summary = summarize(model)
     summary_table.rows = [

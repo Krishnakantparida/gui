@@ -55,8 +55,10 @@ at build time -- validate/tune against real files in cassette_layouts/.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import ezdxf
 from ezdxf.colors import aci2rgb
@@ -106,6 +108,13 @@ class Module:
     uv: tuple[int, int] | None  # (u, v) coordinates parsed from the label, if present
     label: str             # full original label text (may include the (u,v) line)
     centroid: tuple[float, float]
+    # JSON metadata (populated by _enrich_from_json)
+    module_type: str = ""          # e.g. "TM-G8RM", "ML-F3T"
+    i_rot: int | None = None
+    trig_links: int | None = None
+    daq_links: int | None = None
+    is_wagon: bool = False         # True for W* / E* modules in LD/wagon trains
+    wagon_name: str = ""           # e.g. "WW11A1" or "WE30A3"
 
 
 @dataclass
@@ -116,6 +125,8 @@ class Engine:
     train_id: str
     color_key: str
     color_rgb: tuple[int, int, int]
+    # JSON metadata
+    engine_type: str = ""          # e.g. "EL10E0", "EH10H0"
 
 
 @dataclass
@@ -125,6 +136,7 @@ class CassetteModel:
     engines: list[Engine] = field(default_factory=list)
     trains: list[Train] = field(default_factory=list)
     bounds: tuple[float, float, float, float] = (0, 0, 1, 1)
+    wagons_visible: bool = True
 
 
 @dataclass
@@ -563,13 +575,110 @@ def load_cassette(filepath: str, name: str) -> CassetteModel:
         all_y = [0, 1]
     bounds = (min(all_x), min(all_y), max(all_x), max(all_y))
 
-    return CassetteModel(
+    model = CassetteModel(
         name=name,
         modules=modules,
         engines=engines,
         trains=trains.all(),
         bounds=bounds,
     )
+
+    # Enrich modules and engines with JSON metadata if a sidecar file exists.
+    json_path = Path(filepath).with_suffix(".json")
+    if json_path.exists():
+        _enrich_from_json(model, json_path)
+
+    return model
+
+
+def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
+    """Load the JSON sidecar and annotate each Module/Engine with its metadata.
+
+    JSON layout: { cassette_half: { train_name: { module_code: { type, i_rot,
+    trigLinks, daqLinks }, "engine": { type }, "wagon_west": str,
+    "wagon_east": str, "wagon_type": str } } }
+
+    Matching strategy:
+      1. The JSON may describe one or both cassette halves (top-level keys like
+         "44C", "18C", "7B", "33B").
+      2. Within each half, sub-keys are train labels ("TL1", "LD2", "HD1", …).
+      3. Module codes inside a train entry are matched to Module.code after
+         stripping the (u,v) text — the code must appear in both the DXF label
+         and the JSON.
+    """
+    try:
+        with open(json_path) as f:
+            raw = json.load(f)
+    except Exception:
+        return
+
+    # Flatten all halves into one dict: { train_label: train_entry }
+    train_entries: dict[str, dict] = {}
+    for half_data in raw.values():
+        if isinstance(half_data, dict):
+            train_entries.update(half_data)
+
+    # Build lookup: train_label -> train_id (from model.trains)
+    label_to_train_id = {t.label: t.id for t in model.trains}
+
+    # Build lookup: (train_id, code) -> Module
+    module_lookup: dict[tuple[str, str], Module] = {}
+    for m in model.modules:
+        module_lookup[(m.train_id, m.code)] = m
+
+    for train_label, train_entry in train_entries.items():
+        if not isinstance(train_entry, dict):
+            continue
+        train_id = label_to_train_id.get(train_label)
+
+        # Collect wagon name(s) for this train entry.
+        wagon_west = train_entry.get("wagon_west", "")
+        wagon_east = train_entry.get("wagon_east", "")
+        wagon_type = train_entry.get("wagon_type", "")
+
+        for key, value in train_entry.items():
+            if key in ("engine", "wagon_west", "wagon_east", "wagon_type"):
+                continue
+            if not isinstance(value, dict):
+                continue
+
+            # --- module enrichment ---
+            if train_id is not None:
+                mod = module_lookup.get((train_id, key))
+                if mod is not None:
+                    mod.module_type = value.get("type", "")
+                    mod.i_rot = value.get("i_rot")
+                    mod.trig_links = value.get("trigLinks")
+                    mod.daq_links = value.get("daqLinks")
+                    # Wagon modules are W* (west side) or E* (east side) in
+                    # LD-style trains that carry wagon_west / wagon_east fields.
+                    if key.startswith("W") and (wagon_west or wagon_type):
+                        mod.is_wagon = True
+                        mod.wagon_name = wagon_west or wagon_type
+                    elif key.startswith("E") and (wagon_east or wagon_type):
+                        mod.is_wagon = True
+                        mod.wagon_name = wagon_east or wagon_type
+                    elif wagon_type:
+                        # HD-style trains: all modules share one wagon_type
+                        mod.is_wagon = True
+                        mod.wagon_name = wagon_type
+
+        # --- engine enrichment ---
+        eng_entry = train_entry.get("engine")
+        if isinstance(eng_entry, dict) and train_id is not None:
+            eng_type = eng_entry.get("type", "")
+            # Engines all land on a generic ACI color so their train_id from
+            # DXF is unreliable. Match by proximity: find the untyped engine
+            # whose center is closest to the centroid of this train's modules.
+            train_mods = [mod for mod in model.modules if mod.train_id == train_id]
+            if train_mods:
+                cx = sum(mod.centroid[0] for mod in train_mods) / len(train_mods)
+                cy = sum(mod.centroid[1] for mod in train_mods) / len(train_mods)
+                untyped = [e for e in model.engines if not e.engine_type]
+                if untyped:
+                    best = min(untyped, key=lambda e: (e.center[0]-cx)**2 + (e.center[1]-cy)**2)
+                    best.engine_type = eng_type
+                    best.train_id = train_id
 
 
 def summarize(model: CassetteModel) -> CassetteSummary:

@@ -4,9 +4,11 @@ Each module is rendered as a filled+outlined shape with its module code
 and (u,v) coordinates drawn as text on top, plus a transparent "hit"
 overlay that drives hover tooltips via a few small global JS functions
 (defined once in main_test.py via ui.add_head_html). Engines are drawn
-as filled circles with their own hit overlays. Hover math is done in
-screen pixels against the display container's bounding rect, so it works
-correctly regardless of how the SVG is scaled to fit its flex-1 container.
+as filled circles with their own hit overlays. Wagons are module polygons
+with a distinct visual treatment (hatched / lighter fill, no label text).
+Hover math is done in screen pixels against the display container's
+bounding rect, so it works correctly regardless of how the SVG is scaled
+to fit its flex-1 container.
 """
 
 from __future__ import annotations
@@ -35,21 +37,46 @@ FAIL_FILL = "#ef4444"
 
 
 def _module_tooltip(m: Module, train_label: str) -> str:
-    """Tooltip text for a module: everything NOT already drawn on the shape."""
     lines = [f"Code: {m.code}"]
     if m.uv is not None:
         lines.append(f"(u, v): ({m.uv[0]}, {m.uv[1]})")
     lines.append(f"Shape: {SHAPE_LABEL.get(m.shape, m.shape)}")
     lines.append(f"Train: {train_label}")
+    if m.module_type:
+        lines.append(f"Type: {m.module_type}")
+    if m.i_rot is not None:
+        lines.append(f"Rotation: {m.i_rot}")
+    if m.trig_links is not None:
+        lines.append(f"Trig links: {m.trig_links}")
+    if m.daq_links is not None:
+        lines.append(f"DAQ links: {m.daq_links}")
     r, g, b = m.color_rgb
     lines.append(f"Color: rgb({r}, {g}, {b})")
     return "\n".join(lines)
 
 
-def _engine_tooltip(e: Engine, train_label: str) -> str:
-    """Tooltip text for an engine."""
-    lines = ["Engine"]
+def _wagon_tooltip(m: Module, train_label: str) -> str:
+    lines = [f"Wagon: {m.wagon_name}" if m.wagon_name else "Wagon"]
+    lines.append(f"Module code: {m.code}")
+    if m.uv is not None:
+        lines.append(f"(u, v): ({m.uv[0]}, {m.uv[1]})")
     lines.append(f"Train: {train_label}")
+    if m.module_type:
+        lines.append(f"Type: {m.module_type}")
+    if m.i_rot is not None:
+        lines.append(f"Rotation: {m.i_rot}")
+    if m.trig_links is not None:
+        lines.append(f"Trig links: {m.trig_links}")
+    if m.daq_links is not None:
+        lines.append(f"DAQ links: {m.daq_links}")
+    return "\n".join(lines)
+
+
+def _engine_tooltip(e: Engine, train_label: str) -> str:
+    lines = [f"Engine: {e.engine_type}" if e.engine_type else "Engine"]
+    lines.append(f"Train: {train_label}")
+    if e.engine_type:
+        lines.append(f"Type: {e.engine_type}")
     r, g, b = e.color_rgb
     lines.append(f"Color: rgb({r}, {g}, {b})")
     cx, cy = e.center
@@ -70,8 +97,6 @@ def build_svg(model: CassetteModel) -> str:
     view_w = w + 2 * pad_x
     view_h = h + 2 * pad_y
 
-    # translate module points into a top-left-origin, Y-down coordinate
-    # space sized (view_w, view_h) so the viewBox can start at 0,0
     def tx(x: float) -> float:
         return x - view_minx
 
@@ -99,54 +124,71 @@ def build_svg(model: CassetteModel) -> str:
 
     stroke_width = max(view_w, view_h) * 0.0035
     font_size = max(view_w, view_h) * 0.022
-    # choose a readable text color per module: white on dark fills, dark on light fills
-    def text_color(rgb: tuple[int, int, int]) -> str:
-        r, g, b = rgb
-        luminance = 0.299 * r + 0.587 * g + 0.114 * b
-        return "#0f172a" if luminance > 140 else "#f8fafc"
 
     for m in model.modules:
         points = pts_str(m.polygon)
         r, g, b = m.color_rgb
-        fill = f"rgb({r},{g},{b})"
         train_label = train_label_by_id.get(m.train_id, m.train_id)
-        tooltip_json = json.dumps(_module_tooltip(m, train_label))
-        tooltip_text = html.escape(tooltip_json, quote=True)
         data_train = html.escape(m.train_id, quote=True)
 
-        parts.append(
-            f'<polygon points="{points}" fill="{fill}" fill-opacity="0.82" '
-            f'stroke="{SHAPE_STROKE.get(m.shape, "#e2e8f0")}" stroke-width="{stroke_width:.3f}" '
-            f'class="module-shape" data-shape="{html.escape(m.shape)}" '
-            f'data-train="{data_train}"></polygon>'
-        )
-        # module code + (u,v) text drawn at the centroid
-        cx, cy = m.centroid
-        sx, sy = tx(cx), ty(cy)
-        tcolor = text_color(m.color_rgb)
-        label_lines = [m.code]
-        if m.uv is not None:
-            label_lines.append(f"({m.uv[0]},{m.uv[1]})")
-        parts.append(
-            f'<text x="{sx:.2f}" y="{sy:.2f}" text-anchor="middle" '
-            f'dominant-baseline="central" fill="{tcolor}" '
-            f'font-size="{font_size:.2f}" font-family="monospace" '
-            f'font-weight="600" pointer-events="none" '
-            f'class="module-label" data-train="{data_train}">'
-            + "".join(
-                f'<tspan x="{sx:.2f}" dy="{i * 1.1:.2f}em">{html.escape(ln)}</tspan>'
-                for i, ln in enumerate(label_lines)
+        if m.is_wagon:
+            # Wagon: lighter fill, dashed stroke, no text label.
+            # data-wagon attribute drives the wagon-layer toggle.
+            fill = f"rgba({r},{g},{b},0.45)"
+            tooltip_json = json.dumps(_wagon_tooltip(m, train_label))
+            tooltip_text = html.escape(tooltip_json, quote=True)
+            parts.append(
+                f'<polygon points="{points}" fill="{fill}" '
+                f'stroke="{SHAPE_STROKE.get(m.shape, "#e2e8f0")}" stroke-width="{stroke_width:.3f}" '
+                f'stroke-dasharray="{stroke_width * 3:.2f} {stroke_width * 2:.2f}" '
+                f'class="module-shape wagon-shape" data-shape="{html.escape(m.shape)}" '
+                f'data-train="{data_train}" data-wagon="true"></polygon>'
             )
-            + "</text>"
-        )
-        parts.append(
-            f'<polygon points="{points}" fill="transparent" stroke="none" '
-            f'class="module-hit" style="cursor:pointer;" '
-            f'data-train="{data_train}" '
-            f'onmouseenter="cassetteHover(event, {tooltip_text})" '
-            f'onmousemove="cassetteMove(event)" '
-            f'onmouseleave="cassetteLeave(event)"></polygon>'
-        )
+            cx, cy = m.centroid
+            sx, sy = tx(cx), ty(cy)
+            parts.append(
+                f'<polygon points="{points}" fill="transparent" stroke="none" '
+                f'class="module-hit wagon-hit" style="cursor:pointer;" '
+                f'data-train="{data_train}" data-wagon="true" '
+                f'onmouseenter="cassetteHover(event, {tooltip_text})" '
+                f'onmousemove="cassetteMove(event)" '
+                f'onmouseleave="cassetteLeave(event)"></polygon>'
+            )
+        else:
+            fill = f"rgb({r},{g},{b})"
+            tooltip_json = json.dumps(_module_tooltip(m, train_label))
+            tooltip_text = html.escape(tooltip_json, quote=True)
+            parts.append(
+                f'<polygon points="{points}" fill="{fill}" fill-opacity="0.82" '
+                f'stroke="{SHAPE_STROKE.get(m.shape, "#e2e8f0")}" stroke-width="{stroke_width:.3f}" '
+                f'class="module-shape" data-shape="{html.escape(m.shape)}" '
+                f'data-train="{data_train}"></polygon>'
+            )
+            cx, cy = m.centroid
+            sx, sy = tx(cx), ty(cy)
+            label_lines = [m.code]
+            if m.uv is not None:
+                label_lines.append(f"({m.uv[0]},{m.uv[1]})")
+            parts.append(
+                f'<text x="{sx:.2f}" y="{sy:.2f}" text-anchor="middle" '
+                f'dominant-baseline="central" '
+                f'font-size="{font_size:.2f}" font-family="monospace" '
+                f'font-weight="600" pointer-events="none" '
+                f'class="module-label" data-train="{data_train}">'
+                + "".join(
+                    f'<tspan x="{sx:.2f}" dy="{i * 1.1:.2f}em">{html.escape(ln)}</tspan>'
+                    for i, ln in enumerate(label_lines)
+                )
+                + "</text>"
+            )
+            parts.append(
+                f'<polygon points="{points}" fill="transparent" stroke="none" '
+                f'class="module-hit" style="cursor:pointer;" '
+                f'data-train="{data_train}" '
+                f'onmouseenter="cassetteHover(event, {tooltip_text})" '
+                f'onmousemove="cassetteMove(event)" '
+                f'onmouseleave="cassetteLeave(event)"></polygon>'
+            )
 
     for e in model.engines:
         cx, cy = e.center
@@ -177,24 +219,21 @@ def build_svg(model: CassetteModel) -> str:
 
 
 def _test_module_tooltip(m: Module, passed: bool) -> str:
-    """Tooltip text for a module in the test-results view."""
     lines = [f"Code: {m.code}"]
     if m.uv is not None:
         lines.append(f"(u, v): ({m.uv[0]}, {m.uv[1]})")
     lines.append(f"Shape: {SHAPE_LABEL.get(m.shape, m.shape)}")
+    if m.is_wagon and m.wagon_name:
+        lines.append(f"Wagon: {m.wagon_name}")
+    if m.module_type:
+        lines.append(f"Type: {m.module_type}")
     lines.append(f"Test: {'Pass' if passed else 'Fail'}")
     lines.append(f"Reason: N/A")
     return "\n".join(lines)
 
 
 def build_test_svg(model: CassetteModel, results: dict[str, bool]) -> str:
-    """Build an interactive SVG showing per-module test results.
-
-    ``results`` maps ``Module.id`` -> pass/fail (True = pass). Modules are
-    colored green (pass) or red (fail); engines are omitted. Each module's
-    ``data-status`` attribute ("pass"/"fail") drives the legend's checkbox
-    toggling via the shared ``setTrainVisible`` JS helper.
-    """
+    """Build an interactive SVG showing per-module test results."""
     minx, miny, maxx, maxy = model.bounds
     w = max(maxx - minx, 1e-6)
     h = max(maxy - miny, 1e-6)
@@ -240,34 +279,44 @@ def build_test_svg(model: CassetteModel, results: dict[str, bool]) -> str:
         tooltip_json = json.dumps(_test_module_tooltip(m, passed))
         tooltip_text = html.escape(tooltip_json, quote=True)
         data_status = html.escape(status, quote=True)
+        wagon_attr = ' data-wagon="true"' if m.is_wagon else ""
 
-        parts.append(
-            f'<polygon points="{points}" fill="{fill}" fill-opacity="0.82" '
-            f'stroke="#e2e8f0" stroke-width="{stroke_width:.3f}" '
-            f'class="module-shape" data-shape="{html.escape(m.shape)}" '
-            f'data-train="{data_status}"></polygon>'
-        )
-        cx, cy = m.centroid
-        sx, sy = tx(cx), ty(cy)
-        label_lines = [m.code]
-        if m.uv is not None:
-            label_lines.append(f"({m.uv[0]},{m.uv[1]})")
-        parts.append(
-            f'<text x="{sx:.2f}" y="{sy:.2f}" text-anchor="middle" '
-            f'dominant-baseline="central" fill="#f8fafc" '
-            f'font-size="{font_size:.2f}" font-family="monospace" '
-            f'font-weight="600" pointer-events="none" '
-            f'class="module-label" data-train="{data_status}">'
-            + "".join(
-                f'<tspan x="{sx:.2f}" dy="{i * 1.1:.2f}em">{html.escape(ln)}</tspan>'
-                for i, ln in enumerate(label_lines)
+        if m.is_wagon:
+            parts.append(
+                f'<polygon points="{points}" fill="{fill}" fill-opacity="0.55" '
+                f'stroke="#e2e8f0" stroke-width="{stroke_width:.3f}" '
+                f'stroke-dasharray="{stroke_width * 3:.2f} {stroke_width * 2:.2f}" '
+                f'class="module-shape wagon-shape" data-shape="{html.escape(m.shape)}" '
+                f'data-train="{data_status}"{wagon_attr}></polygon>'
             )
-            + "</text>"
-        )
+        else:
+            parts.append(
+                f'<polygon points="{points}" fill="{fill}" fill-opacity="0.82" '
+                f'stroke="#e2e8f0" stroke-width="{stroke_width:.3f}" '
+                f'class="module-shape" data-shape="{html.escape(m.shape)}" '
+                f'data-train="{data_status}"></polygon>'
+            )
+            cx, cy = m.centroid
+            sx, sy = tx(cx), ty(cy)
+            label_lines = [m.code]
+            if m.uv is not None:
+                label_lines.append(f"({m.uv[0]},{m.uv[1]})")
+            parts.append(
+                f'<text x="{sx:.2f}" y="{sy:.2f}" text-anchor="middle" '
+                f'dominant-baseline="central" fill="#f8fafc" '
+                f'font-size="{font_size:.2f}" font-family="monospace" '
+                f'font-weight="600" pointer-events="none" '
+                f'class="module-label" data-train="{data_status}">'
+                + "".join(
+                    f'<tspan x="{sx:.2f}" dy="{i * 1.1:.2f}em">{html.escape(ln)}</tspan>'
+                    for i, ln in enumerate(label_lines)
+                )
+                + "</text>"
+            )
         parts.append(
             f'<polygon points="{points}" fill="transparent" stroke="none" '
             f'class="module-hit" style="cursor:pointer;" '
-            f'data-train="{data_status}" '
+            f'data-train="{data_status}"{wagon_attr} '
             f'onmouseenter="cassetteHover(event, {tooltip_text})" '
             f'onmousemove="cassetteMove(event)" '
             f'onmouseleave="cassetteLeave(event)"></polygon>'
