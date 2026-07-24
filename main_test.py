@@ -16,6 +16,8 @@ test-results view.
 """
 
 import random
+import tempfile
+import os
 from pathlib import Path
 import asyncio
 from nicegui import ui, app
@@ -112,47 +114,59 @@ ui.add_css("""
         text-align: center;
     }
     /* ---- Theme-aware display components ---- */
-    /* Light mode (default): black strokes, light legend/tooltip */
+    /* Dark mode is the DEFAULT (the app starts in dark mode). Light mode
+       is opt-in via the .cassette-light class on <body>. Train fill colors
+       are NEVER changed -- only strokes, labels, legend and tooltip. */
     .cassette-svg-wrap .module-shape,
     .cassette-svg-wrap .engine-shape {
-        stroke: #000000;
-    }
-    .legend-overlay .text-gray-400 {
-        color: #475569 !important;
-    }
-    .progress-overlay .text-gray-200 {
-        color: #0f172a !important;
-    }
-    #cassette-tooltip {
-        background: rgba(241, 245, 249, 0.95);
-        border-color: rgba(100, 116, 139, 0.4);
-        color: #0f172a;
-    }
-    #cassette-display-area {
-        background: rgba(0, 0, 0, 0.02);
-    }
-    /* Dark mode: white strokes, dark legend/tooltip */
-    .cassette-dark .cassette-svg-wrap .module-shape,
-    .cassette-dark .cassette-svg-wrap .engine-shape {
         stroke: #ffffff;
     }
-    .cassette-dark .legend-overlay {
+    .cassette-svg-wrap .module-label {
+        fill: #f8fafc !important;
+    }
+    .legend-overlay {
         border-color: rgba(148, 163, 184, 0.35);
         background: rgba(15, 23, 42, 0.82);
     }
-    .cassette-dark .legend-overlay .text-gray-400 {
+    .legend-overlay .text-gray-400 {
         color: #94a3b8 !important;
     }
-    .cassette-dark .progress-overlay .text-gray-200 {
+    .progress-overlay .text-gray-200 {
         color: #e2e8f0 !important;
     }
-    .cassette-dark #cassette-tooltip {
+    #cassette-tooltip {
         background: rgba(15, 23, 42, 0.95);
         border-color: rgba(148, 163, 184, 0.4);
         color: #f1f5f9;
     }
-    .cassette-dark #cassette-display-area {
+    #cassette-display-area {
         background: rgba(255, 255, 255, 0.02);
+    }
+    /* Light mode overrides */
+    .cassette-light .cassette-svg-wrap .module-shape,
+    .cassette-light .cassette-svg-wrap .engine-shape {
+        stroke: #000000;
+    }
+    .cassette-light .cassette-svg-wrap .module-label {
+        fill: #0f172a !important;
+    }
+    .cassette-light .legend-overlay {
+        border-color: rgba(100, 116, 139, 0.35);
+        background: rgba(241, 245, 249, 0.88);
+    }
+    .cassette-light .legend-overlay .text-gray-400 {
+        color: #475569 !important;
+    }
+    .cassette-light .progress-overlay .text-gray-200 {
+        color: #0f172a !important;
+    }
+    .cassette-light #cassette-tooltip {
+        background: rgba(241, 245, 249, 0.95);
+        border-color: rgba(100, 116, 139, 0.4);
+        color: #0f172a;
+    }
+    .cassette-light #cassette-display-area {
+        background: rgba(0, 0, 0, 0.02);
     }
 """)
 
@@ -188,8 +202,8 @@ ui.add_head_html(
         if (!tip) return;
         tip.style.display = 'none';
     }
-    // Apply initial dark-mode class (dark mode is the default on page load).
-    document.body.classList.add("cassette-dark");
+    // Dark mode is the CSS default (no class needed). Light mode is opt-in
+    // via the .cassette-light class on <body>.
     // Toggle visibility of every SVG element belonging to a train. When a
     // train is unchecked, its modules/engines/labels are dimmed (not
     // removed) so the layout stays stable and re-toggling is instant.
@@ -214,10 +228,10 @@ def _on_theme_toggle(e):
     """Toggle dark mode and the cassette display's colour scheme."""
     if e.value:
         dark_mode.enable()
-        ui.run_javascript('document.body.classList.add("cassette-dark");')
+        ui.run_javascript('document.body.classList.remove("cassette-light");')
     else:
         dark_mode.disable()
-        ui.run_javascript('document.body.classList.remove("cassette-dark");')
+        ui.run_javascript('document.body.classList.add("cassette-light");')
 
 # ============================================================
 # Header: CMS logo + title on the left, menu dropdown on the right
@@ -270,6 +284,8 @@ state = {
     "test_results": {},        # module.id -> bool (True = pass)
     "view_mode": "trains",     # "trains" | "test"
     "test_in_progress": False,
+    "trains_svg_file": None,   # path to temp .svg for the trains view
+    "test_svg_file": None,    # path to temp .svg for the test-results view
 }
 
 with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
@@ -434,23 +450,50 @@ def _on_test_toggle(status: str, visible: bool) -> None:
     )
 
 
+def _save_svg_temp(svg_content: str, label: str) -> str | None:
+    """Write SVG content to a temp file and return its path."""
+    try:
+        fd, path = tempfile.mkstemp(suffix=f"_{label}.svg", prefix="cassette_")
+        with os.fdopen(fd, "w") as f:
+            f.write(svg_content)
+        return path
+    except OSError:
+        return None
+
+
+def _load_svg_temp(path: str) -> str | None:
+    """Read SVG content back from a temp file."""
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except (OSError, FileNotFoundError):
+        return None
+
+
+def _render_svg_content(svg_content: str) -> None:
+    """Push SVG markup into the svg_slot."""
+    svg_slot.clear()
+    with svg_slot:
+        ui.html(svg_content, sanitize=False).classes("w-full h-full")
+
+
 def _render_view() -> None:
-    """Render the SVG for the current view_mode into svg_slot."""
+    """Render the SVG for the current view_mode into svg_slot.
+
+    The generated SVG is also saved to a temp file so the arrow buttons
+    can reload it instantly without regenerating."""
     model = state["model"]
     if model is None:
         return
-    svg_slot.clear()
     if state["view_mode"] == "test":
         svg_content = build_test_svg(model, state["test_results"])
         _render_test_legend(model, state["test_results"])
+        state["test_svg_file"] = _save_svg_temp(svg_content, "test")
     else:
         svg_content = build_svg(model)
         _render_legend(model)
-    with svg_slot:
-        # sanitize=False: the SVG is our own trusted output (not user input) and
-        # relies on inline onmouse* handlers for hover tooltips, which NiceGUI's
-        # default DOMPurify sanitization strips.
-        ui.html(svg_content, sanitize=False).classes("w-full h-full")
+        state["trains_svg_file"] = _save_svg_temp(svg_content, "trains")
+    _render_svg_content(svg_content)
 
 
 def _update_toggle_buttons() -> None:
@@ -460,18 +503,28 @@ def _update_toggle_buttons() -> None:
         toggle_right.props("disabled")
         return
     if state["view_mode"] == "test":
-        toggle_left.props("disabled=false")
+        toggle_left.props(remove="disabled")
         toggle_right.props("disabled")
     else:  # trains
         toggle_left.props("disabled")
-        toggle_right.props("disabled=false")
+        toggle_right.props(remove="disabled")
 
 
 def _on_toggle_left() -> None:
     if state["view_mode"] != "test":
         return
     state["view_mode"] = "trains"
-    _render_view()
+    # Load the previously-saved trains SVG from its temp file instead of
+    # regenerating it from the model.
+    svg_file = state.get("trains_svg_file")
+    svg_content = _load_svg_temp(svg_file) if svg_file else None
+    if svg_content is not None:
+        _render_svg_content(svg_content)
+        model = state["model"]
+        if model is not None:
+            _render_legend(model)
+    else:
+        _render_view()
     _update_toggle_buttons()
 
 
@@ -479,7 +532,17 @@ def _on_toggle_right() -> None:
     if state["view_mode"] != "trains" or not state["test_results"]:
         return
     state["view_mode"] = "test"
-    _render_view()
+    # Load the previously-saved test-results SVG from its temp file instead
+    # of regenerating it from the model.
+    svg_file = state.get("test_svg_file")
+    svg_content = _load_svg_temp(svg_file) if svg_file else None
+    if svg_content is not None:
+        _render_svg_content(svg_content)
+        model = state["model"]
+        if model is not None:
+            _render_test_legend(model, state["test_results"])
+    else:
+        _render_view()
     _update_toggle_buttons()
 
 
