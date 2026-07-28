@@ -193,7 +193,7 @@ def build_svg(model: CassetteModel) -> str:
     for e in model.engines:
         cx, cy = e.center
         sx, sy = tx(cx), ty(cy)
-        radius = e.radius / 2.5
+        radius = e.radius * 2.5
         r, g, b = e.color_rgb
         fill = f"rgb({r},{g},{b})"
         train_label = train_label_by_id.get(e.train_id, e.train_id)
