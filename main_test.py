@@ -71,7 +71,9 @@ ui.add_css("""
         max-width: 100%; max-height: 100%;
     }
     .module-shape, .module-label, .module-hit,
-    .engine-shape, .engine-hit {
+    .engine-shape, .engine-hit,
+    .wagon-shape, .wagon-label, .wagon-hit,
+    .board-shape, .board-label, .board-hit {
         transition: opacity 0.2s ease;
     }
     .dimmed { opacity: 0.12 !important; }
@@ -122,10 +124,14 @@ ui.add_css("""
        is opt-in via the .cassette-light class on <body>. Train fill colors
        are NEVER changed -- only strokes, labels, legend and tooltip. */
     .cassette-svg-wrap .module-shape,
-    .cassette-svg-wrap .engine-shape {
+    .cassette-svg-wrap .engine-shape,
+    .cassette-svg-wrap .wagon-shape,
+    .cassette-svg-wrap .board-shape {
         stroke: #ffffff;
     }
-    .cassette-svg-wrap .module-label {
+    .cassette-svg-wrap .module-label,
+    .cassette-svg-wrap .wagon-label,
+    .cassette-svg-wrap .board-label {
         fill: #f8fafc !important;
     }
     .legend-overlay {
@@ -148,10 +154,14 @@ ui.add_css("""
     }
     /* Light mode overrides */
     .cassette-light .cassette-svg-wrap .module-shape,
-    .cassette-light .cassette-svg-wrap .engine-shape {
+    .cassette-light .cassette-svg-wrap .engine-shape,
+    .cassette-light .cassette-svg-wrap .wagon-shape,
+    .cassette-light .cassette-svg-wrap .board-shape {
         stroke: #000000;
     }
-    .cassette-light .cassette-svg-wrap .module-label {
+    .cassette-light .cassette-svg-wrap .module-label,
+    .cassette-light .cassette-svg-wrap .wagon-label,
+    .cassette-light .cassette-svg-wrap .board-label {
         fill: #0f172a !important;
     }
     .cassette-light .legend-overlay {
@@ -224,6 +234,14 @@ ui.add_head_html(
         const svg = document.querySelector('.cassette-svg-wrap svg');
         if (!svg) return;
         svg.querySelectorAll('[data-wagon="true"]').forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
+    function setEnginesVisible(visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        svg.querySelectorAll('.engine-shape, .engine-hit').forEach((el) => {
             if (visible) el.classList.remove('dimmed');
             else el.classList.add('dimmed');
         });
@@ -385,12 +403,29 @@ def _render_legend(model) -> None:
         ui.label("Trains and Engines").classes(
             "text-sm text-gray-400"
         )
+        train_has_elements = {
+            t.id: (
+                any(m.train_id == t.id for m in model.modules)
+                or any(e.train_id == t.id for e in model.engines)
+                or any(w.train_id == t.id for w in model.wagon_links)
+                or any(wb.train_id == t.id for wb in model.wingboards)
+            )
+            for t in model.trains
+        }
         for t in model.trains:
+            if not train_has_elements.get(t.id, False):
+                continue
             r, g, b = t.color_rgb
             swatch = f"rgb({r},{g},{b})"
+            label = t.label
+            if label.startswith("Train "):
+                engine_types = sorted(
+                    {e.engine_type for e in model.engines if e.train_id == t.id and e.engine_type}
+                )
+                label = f"Engine: {', '.join(engine_types)}" if engine_types else "Engine"
             with ui.row().classes("legend-row w-full items-center"):
                 cb = ui.checkbox(
-                    text=t.label,
+                    text=label,
                     value=True,
                     on_change=lambda e, tid=t.id: _on_train_toggle(tid, e.value),
                 ).classes("flex-1")
@@ -412,7 +447,7 @@ def _render_legend(model) -> None:
                 ui.element("div").classes("legend-swatch engine").style(
                     f"background:{swatch};"
                 )
-        has_wagons = any(m.is_wagon for m in model.modules)
+        has_wagons = bool(model.wagon_links)
         if has_wagons:
             ui.separator().classes("w-full")
             with ui.row().classes("legend-row w-full items-center"):
@@ -420,7 +455,7 @@ def _render_legend(model) -> None:
                     text="Wagons",
                     value=state["wagons_visible"],
                     on_change=lambda e: _on_wagons_toggle(e.value),
-                ).classes("flex-1").tooltip("Wagon modules (W/E prefixed, dashed outline)")
+                ).classes("flex-1").tooltip("Dashed wagon connector overlays")
                 ui.element("div").classes("legend-swatch wagon").style(
                     "background:rgba(148,163,184,0.45);border-style:dashed;"
                 )
@@ -464,15 +499,7 @@ def _on_wagons_toggle(visible: bool) -> None:
 
 def _on_engines_toggle(visible: bool) -> None:
     state["engines_visible"] = visible
-    model = state["model"]
-    if model is None:
-        return
-    # engines may belong to one or more trains; toggle each
-    engine_train_ids = {e.train_id for e in model.engines}
-    for tid in engine_train_ids:
-        ui.run_javascript(
-            f'setTrainVisible({tid!r}, {"true" if visible else "false"});'
-        )
+    ui.run_javascript(f'setEnginesVisible({"true" if visible else "false"});')
 
 
 def _on_test_toggle(status: str, visible: bool) -> None:
@@ -696,6 +723,8 @@ def load_selected(name: str) -> None:
         {"field": "Tile Modules", "value": summary.tile},
         {"field": "Trains", "value": summary.trains},
         {"field": "Engines", "value": summary.engines},
+        {"field": "Wingboards", "value": summary.wingboards},
+        {"field": "Motherboards", "value": summary.motherboards},
     ]
     summary_table.update()
 

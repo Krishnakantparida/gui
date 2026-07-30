@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,6 +86,7 @@ DEFAULT_COLOR_RGB = (148, 163, 184)  # slate-400, used when color can't be resol
 ENGINES_LAYER = "ENGINES"
 MODULE_LABEL_COLOR = 250  # MTEXT dxf.color for module labels (code + (u,v))
 TRAIN_LABEL_COLOR = 0      # MTEXT dxf.color for train names (TL1, LD1, ...)
+REAL_TRAIN_LABEL_RE = re.compile(r"^(?:TL|TH|LD|HD)\d*$")
 
 
 @dataclass
@@ -113,8 +115,41 @@ class Module:
     i_rot: int | None = None
     trig_links: int | None = None
     daq_links: int | None = None
-    is_wagon: bool = False         # True for W* / E* modules in LD/wagon trains
-    wagon_name: str = ""           # e.g. "WW11A1" or "WE30A3"
+    wagon_name: str = ""           # e.g. "WW11A1" or "WE30A3", when connected by a wagon
+
+
+@dataclass
+class WagonLink:
+    id: str
+    train_id: str
+    color_rgb: tuple[int, int, int]
+    name: str
+    from_point: tuple[float, float]
+    to_point: tuple[float, float]
+    label_point: tuple[float, float]
+    polygon: list[tuple[float, float]]
+    module_code: str
+    uv: tuple[int, int] | None
+
+
+@dataclass
+class Wingboard:
+    id: str
+    train_id: str
+    name: str
+    module_id: str
+    module_code: str
+    polygon: list[tuple[float, float]]
+    centroid: tuple[float, float]
+
+
+@dataclass
+class Motherboard:
+    id: str
+    train_id: str
+    name: str
+    center: tuple[float, float]
+    radius: float
 
 
 @dataclass
@@ -134,6 +169,9 @@ class CassetteModel:
     name: str
     modules: list[Module] = field(default_factory=list)
     engines: list[Engine] = field(default_factory=list)
+    wagon_links: list[WagonLink] = field(default_factory=list)
+    wingboards: list[Wingboard] = field(default_factory=list)
+    motherboards: list[Motherboard] = field(default_factory=list)
     trains: list[Train] = field(default_factory=list)
     bounds: tuple[float, float, float, float] = (0, 0, 1, 1)
     wagons_visible: bool = True
@@ -147,6 +185,8 @@ class CassetteSummary:
     tile: int
     trains: int
     engines: int
+    wingboards: int
+    motherboards: int
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +297,86 @@ def _centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
         return (sum(xs) / len(xs), sum(ys) / len(ys))
     c = poly.centroid
     return (c.x, c.y)
+
+
+def _is_real_train_label(label: str) -> bool:
+    return bool(REAL_TRAIN_LABEL_RE.match(label.strip()))
+
+
+def _module_number(code: str) -> int:
+    match = re.search(r"(\d+)", code)
+    return int(match.group(1)) if match else 0
+
+
+def _bounds(points: list[tuple[float, float]]) -> tuple[float, float, float, float]:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _segment_rect(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    width: float,
+) -> list[tuple[float, float]]:
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return []
+    nx = -dy / length * width / 2
+    ny = dx / length * width / 2
+    return [
+        (p0[0] + nx, p0[1] + ny),
+        (p1[0] + nx, p1[1] + ny),
+        (p1[0] - nx, p1[1] - ny),
+        (p0[0] - nx, p0[1] - ny),
+    ]
+
+
+def _angle_between(
+    origin: tuple[float, float],
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> float:
+    v1 = (a[0] - origin[0], a[1] - origin[1])
+    v2 = (b[0] - origin[0], b[1] - origin[1])
+    n1 = math.hypot(*v1)
+    n2 = math.hypot(*v2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return 0.0
+    dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(math.acos(dot))
+
+
+def _typical_module_size(modules: list[Module]) -> float:
+    sizes = []
+    for m in modules:
+        minx, miny, maxx, maxy = _bounds(m.polygon)
+        sizes.append(min(maxx - minx, maxy - miny))
+    return sorted(sizes)[len(sizes) // 2] if sizes else 30.0
+
+
+def _wingboard_polygon(
+    module: Module,
+    train_center: tuple[float, float],
+    thickness: float,
+) -> list[tuple[float, float]]:
+    minx, miny, maxx, maxy = _bounds(module.polygon)
+    length = max((maxy - miny) * 0.82, thickness * 2.4)
+    cy = module.centroid[1]
+    y0 = cy - length / 2
+    y1 = cy + length / 2
+    place_right = module.centroid[0] >= train_center[0]
+    gap = thickness * 0.15
+    if place_right:
+        x0 = maxx + gap
+        x1 = x0 + thickness
+    else:
+        x1 = minx - gap
+        x0 = x1 - thickness
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +708,26 @@ def load_cassette(filepath: str, name: str) -> CassetteModel:
     if json_path.exists():
         _enrich_from_json(model, json_path)
 
+    overlay_x = (
+        [p[0] for w in model.wagon_links for p in w.polygon]
+        + [p[0] for wb in model.wingboards for p in wb.polygon]
+        + [mb.center[0] - mb.radius for mb in model.motherboards]
+        + [mb.center[0] + mb.radius for mb in model.motherboards]
+    )
+    overlay_y = (
+        [p[1] for w in model.wagon_links for p in w.polygon]
+        + [p[1] for wb in model.wingboards for p in wb.polygon]
+        + [mb.center[1] - mb.radius for mb in model.motherboards]
+        + [mb.center[1] + mb.radius for mb in model.motherboards]
+    )
+    if overlay_x and overlay_y:
+        model.bounds = (
+            min(model.bounds[0], min(overlay_x)),
+            min(model.bounds[1], min(overlay_y)),
+            max(model.bounds[2], max(overlay_x)),
+            max(model.bounds[3], max(overlay_y)),
+        )
+
     return model
 
 
@@ -626,6 +766,12 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
     for m in model.modules:
         module_lookup[(m.train_id, m.code)] = m
 
+    train_by_id = {t.id: t for t in model.trains}
+    default_board_radius = max((e.radius for e in model.engines), default=15.0)
+    module_size = _typical_module_size(model.modules)
+    wagon_width = max(module_size * 0.22, default_board_radius * 0.75)
+    board_width = max(default_board_radius * 1.55, module_size * 0.18)
+
     for train_label, train_entry in train_entries.items():
         if not isinstance(train_entry, dict):
             continue
@@ -637,7 +783,7 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
         wagon_type = train_entry.get("wagon_type", "")
 
         for key, value in train_entry.items():
-            if key in ("engine", "wagon_west", "wagon_east", "wagon_type"):
+            if key in ("engine", "wagon_west", "wagon_east", "wagon_type", "wingboard", "motherboard"):
                 continue
             if not isinstance(value, dict):
                 continue
@@ -650,42 +796,145 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
                     mod.i_rot = value.get("i_rot")
                     mod.trig_links = value.get("trigLinks")
                     mod.daq_links = value.get("daqLinks")
-                    # Wagon modules are W* (west side) or E* (east side) in
-                    # LD-style trains that carry wagon_west / wagon_east fields.
                     if key.startswith("W") and (wagon_west or wagon_type):
-                        mod.is_wagon = True
                         mod.wagon_name = wagon_west or wagon_type
                     elif key.startswith("E") and (wagon_east or wagon_type):
-                        mod.is_wagon = True
                         mod.wagon_name = wagon_east or wagon_type
                     elif wagon_type:
-                        # HD-style trains: all modules share one wagon_type
-                        mod.is_wagon = True
                         mod.wagon_name = wagon_type
+
+        if train_id is None:
+            continue
+
+        train_mods = [mod for mod in model.modules if mod.train_id == train_id]
+        if not train_mods:
+            continue
+        train_center = (
+            sum(mod.centroid[0] for mod in train_mods) / len(train_mods),
+            sum(mod.centroid[1] for mod in train_mods) / len(train_mods),
+        )
 
         # --- engine enrichment ---
         eng_entry = train_entry.get("engine")
-        if isinstance(eng_entry, dict) and train_id is not None:
+        if isinstance(eng_entry, dict):
             eng_type = eng_entry.get("type", "")
             # Engines all land on a generic ACI color so their train_id from
             # DXF is unreliable. Match by proximity: find the untyped engine
             # whose center is closest to the centroid of this train's modules.
-            train_mods = [mod for mod in model.modules if mod.train_id == train_id]
-            if train_mods:
-                cx = sum(mod.centroid[0] for mod in train_mods) / len(train_mods)
-                cy = sum(mod.centroid[1] for mod in train_mods) / len(train_mods)
-                untyped = [e for e in model.engines if not e.engine_type]
-                if untyped:
-                    best = min(untyped, key=lambda e: (e.center[0]-cx)**2 + (e.center[1]-cy)**2)
-                    best.engine_type = eng_type
-                    best.train_id = train_id
+            untyped = [e for e in model.engines if not e.engine_type]
+            if untyped:
+                best = min(untyped, key=lambda e: (e.center[0]-train_center[0])**2 + (e.center[1]-train_center[1])**2)
+                best.engine_type = eng_type
+                best.train_id = train_id
+
+        motherboard = train_entry.get("motherboard", "")
+        if motherboard:
+            untyped = [e for e in model.engines if not e.engine_type]
+            if untyped:
+                best = min(untyped, key=lambda e: (e.center[0]-train_center[0])**2 + (e.center[1]-train_center[1])**2)
+                best.engine_type = motherboard
+                best.train_id = train_id
+                model.motherboards.append(
+                    Motherboard(
+                        id=f"motherboard-{len(model.motherboards)}",
+                        train_id=train_id,
+                        name=motherboard,
+                        center=best.center,
+                        radius=best.radius,
+                    )
+                )
+
+        wingboard = train_entry.get("wingboard", "")
+        if wingboard:
+            for mod in train_mods:
+                if mod.shape != "tile" or not mod.code.startswith(("E", "G")):
+                    continue
+                polygon = _wingboard_polygon(mod, train_center, board_width)
+                model.wingboards.append(
+                    Wingboard(
+                        id=f"wingboard-{len(model.wingboards)}",
+                        train_id=train_id,
+                        name=wingboard,
+                        module_id=mod.id,
+                        module_code=mod.code,
+                        polygon=polygon,
+                        centroid=_centroid(polygon),
+                    )
+                )
+
+        engine_center = None
+        typed_engines = [e for e in model.engines if e.train_id == train_id and e.engine_type]
+        if typed_engines:
+            engine_center = min(
+                typed_engines,
+                key=lambda e: (e.center[0]-train_center[0])**2 + (e.center[1]-train_center[1])**2,
+            ).center
+
+        if engine_center is not None and (wagon_west or wagon_east or wagon_type):
+            modules_by_code = {mod.code: mod for mod in train_mods}
+            groups: dict[str, list[Module]] = {}
+            for key, value in train_entry.items():
+                if not isinstance(value, dict) or key not in modules_by_code:
+                    continue
+                prefix = key[:1]
+                groups.setdefault(prefix, []).append(modules_by_code[key])
+
+            for prefix, group_mods in groups.items():
+                group_mods.sort(key=lambda mod: _module_number(mod.code))
+                if not group_mods:
+                    continue
+                wagon_name = wagon_type
+                if prefix == "W":
+                    wagon_name = wagon_west or wagon_type
+                elif prefix == "E":
+                    wagon_name = wagon_east or wagon_type
+                if not wagon_name:
+                    continue
+
+                connections: list[tuple[tuple[float, float], Module]] = [(engine_center, group_mods[0])]
+                if len(group_mods) >= 3:
+                    angle = _angle_between(group_mods[0].centroid, group_mods[1].centroid, group_mods[2].centroid)
+                    if angle >= 30.0:
+                        connections.append((group_mods[0].centroid, group_mods[1]))
+                        connections.append((group_mods[0].centroid, group_mods[2]))
+                        for idx in range(3, len(group_mods)):
+                            connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
+                    else:
+                        for idx in range(1, len(group_mods)):
+                            connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
+                else:
+                    for idx in range(1, len(group_mods)):
+                        connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
+
+                train = train_by_id.get(train_id)
+                color_rgb = train.color_rgb if train is not None else DEFAULT_COLOR_RGB
+                for start, mod in connections:
+                    end = mod.centroid
+                    polygon = _segment_rect(start, end, wagon_width)
+                    if not polygon:
+                        continue
+                    label_point = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+                    model.wagon_links.append(
+                        WagonLink(
+                            id=f"wagon-{len(model.wagon_links)}",
+                            train_id=train_id,
+                            color_rgb=color_rgb,
+                            name=wagon_name,
+                            from_point=start,
+                            to_point=end,
+                            label_point=label_point,
+                            polygon=polygon,
+                            module_code=mod.code,
+                            uv=mod.uv,
+                        )
+                    )
 
 
 def summarize(model: CassetteModel) -> CassetteSummary:
     full_hex = sum(1 for m in model.modules if m.shape == "hex_full")
     partial_hex = sum(1 for m in model.modules if m.shape == "hex_partial")
     tile = sum(1 for m in model.modules if m.shape == "tile")
-    trains = len(model.trains)
+    trains = sum(1 for t in model.trains if _is_real_train_label(t.label))
     cassette_type = "Mixed" if tile > 0 else "Pure silicon"
     return CassetteSummary(
         cassette_type=cassette_type,
@@ -694,4 +943,6 @@ def summarize(model: CassetteModel) -> CassetteSummary:
         tile=tile,
         trains=trains,
         engines=len(model.engines),
+        wingboards=len(model.wingboards),
+        motherboards=len(model.motherboards),
     )
