@@ -1,12 +1,6 @@
 {
     "33B": {
         "HD1": {
-            "engine": {
-                "u": 5.5,
-                "v": 4.5,
-                "type": "EH10H0"
-            },
-            "wagon_type": "WH30BT",
             "M1": {
                 "u": 5,
                 "v": 4,
@@ -30,15 +24,15 @@
                 "i_rot": 4,
                 "trigLinks": 5,
                 "daqLinks": 2
-            }
-        },
-        "HD2": {
+            },
             "engine": {
                 "u": 5.5,
-                "v": 3.5,
+                "v": 4.5,
                 "type": "EH10H0"
             },
-            "wagon_type": "WH20AT",
+            "wagon_type": "WH30BT"
+        },
+        "HD2": {
             "M1": {
                 "u": 5,
                 "v": 3,
@@ -54,16 +48,15 @@
                 "i_rot": 4,
                 "trigLinks": 5,
                 "daqLinks": 1
-            }
+            },
+            "engine": {
+                "u": 5.5,
+                "v": 3.5,
+                "type": "EH10H0"
+            },
+            "wagon_type": "WH20AT"
         },
         "LD3": {
-            "engine": {
-                "u": 9.5,
-                "v": 6.5,
-                "type": "EL10W0"
-            },
-            "wagon_west": "WW30A1",
-            "wagon_east": "WE40A1",
             "W1": {
                 "u": 10,
                 "v": 7,
@@ -119,16 +112,16 @@
                 "i_rot": 4,
                 "trigLinks": 2,
                 "daqLinks": 1
-            }
-        },
-        "LD2": {
+            },
             "engine": {
                 "u": 9.5,
-                "v": 7.5,
+                "v": 6.5,
                 "type": "EL10W0"
             },
-            "wagon_west": "WW21B1",
-            "wagon_east": "WE40A1",
+            "wagon_west": "WW30A1",
+            "wagon_east": "WE40A1"
+        },
+        "LD2": {
             "W1": {
                 "u": 10,
                 "v": 8,
@@ -184,16 +177,16 @@
                 "i_rot": 4,
                 "trigLinks": 2,
                 "daqLinks": 1
-            }
-        },
-        "LD1": {
+            },
             "engine": {
-                "u": 8.5,
+                "u": 9.5,
                 "v": 7.5,
                 "type": "EL10W0"
             },
-            "wagon_west": "WW30A1",
-            "wagon_east": "WE30A1",
+            "wagon_west": "WW21B1",
+            "wagon_east": "WE40A1"
+        },
+        "LD1": {
             "W1": {
                 "u": 9,
                 "v": 8,
@@ -241,16 +234,16 @@
                 "i_rot": 4,
                 "trigLinks": 2,
                 "daqLinks": 1
-            }
-        },
-        "LD4": {
+            },
             "engine": {
-                "u": 9.5,
-                "v": 5.5,
+                "u": 8.5,
+                "v": 7.5,
                 "type": "EL10W0"
             },
             "wagon_west": "WW30A1",
-            "wagon_east": "WE20A1",
+            "wagon_east": "WE30A1"
+        },
+        "LD4": {
             "W1": {
                 "u": 10,
                 "v": 6,
@@ -290,16 +283,16 @@
                 "i_rot": 4,
                 "trigLinks": 2,
                 "daqLinks": 1
-            }
-        },
-        "LD5": {
+            },
             "engine": {
-                "u": 11.5,
-                "v": 6.5,
+                "u": 9.5,
+                "v": 5.5,
                 "type": "EL10W0"
             },
-            "wagon_west": "WW11A1",
-            "wagon_east": "WE21C3",
+            "wagon_west": "WW30A1",
+            "wagon_east": "WE20A1"
+        },
+        "LD5": {
             "W1": {
                 "u": 12,
                 "v": 7,
@@ -339,7 +332,15 @@
                 "i_rot": 2,
                 "trigLinks": 2,
                 "daqLinks": 1
-            }
+            },
+            "engine": {
+                "u": 11.5,
+                "v": 6.5,
+                "type": "EL10W0"
+            },
+            "wagon_west": "WW11A1",
+            "wagon_east": "WE21C3"
         }
-    }
+    },
+    "7B": {}
 }

@@ -1,155 +1,54 @@
-"""
-Parsing and geometric classification of cassette DXF layouts.
+"""Parse a cassette DXF into a structured CassetteModel.
 
-Domain model
-------------
-A cassette layout is made of:
-  - LWPOLYLINE entities  -> the outline of a physical module footprint
-  - HATCH entities       -> the filled/colored region inside a module
-                            (the fill color groups modules into "trains",
-                            i.e. differently colored readout chains)
-  - MTEXT entities       -> text labels. Two kinds, distinguished by
-                            ``dxf.color``:
-                              * color == 250 -> a module label, formatted as
-                                "<code>\n(<u>,<v>)" where <code> is e.g.
-                                "M3", "E3", "W2", "G8" and (u,v) are the
-                                module's (u,v) coordinates on a second line.
-                                Some older cassettes omit the (u,v) line.
-                              * color == 0   -> a train label, e.g. "TL1",
-                                "TL2", "LD1", "HD1" -- the human-readable
-                                name of a train, placed near the train's
-                                engine(s).
-  - CIRCLE entities on layer "ENGINES" -> the "engine" of a train. Engines
-    are drawn in the same color as the train they belong to (a dark-red
-    shade for the "red" trains, magenta for others). An engine is matched
-    to a train by color.
+Layers:
+  SHAPES  — closed LWPOLYLINEs (module hexagons / tiles)
+  TEXT    — MTEXT labels: module code + (u,v), and train label
+  ENGINES — CIRCLEs (engine positions)
 
-A LWPOLYLINE is only counted as a "module" if a HATCH region is matched to
-it (this filters out decorative/frame/outline-only geometry that isn't an
-actual populated module footprint).
+Trains are identified by ACI color of their polylines. Each train's
+modules are grouped by spatial proximity to the train label MTEXT.
+Engines are matched to trains by proximity to each train's module
+centroids (their own ACI color is unreliable).
 
-Shape classification is purely geometric (vertex count + interior angles),
-because that's the only reliable general-purpose way to tell a hexagonal
-(or partially-cut hexagonal) module apart from a tile module without any
-extra metadata in the DXF:
-
-  - "tile"        -> an even vertex count from 4 to 12, with ~all interior
-                     angles close to 90 degrees. A plain rectangle is the
-                     4-sided case; a rectangle with one or more rectangular
-                     notches/steps cut into it (still an all-right-angle
-                     outline) adds 2 vertices per notch, up to 12 -- every
-                     corner, convex or concave, still measures ~90 degrees
-                     as an unsigned interior angle, so no special-casing of
-                     notch direction is needed.
-  - "hex_full"    -> 6 vertices, ~all interior angles close to 120 degrees
-                     and roughly equal edge lengths
-  - "hex_partial" -> anything else, i.e. "part of" a hexagon -- this
-                     deliberately covers footprints with 3, 4, 5, or 7+
-                     vertices (corner-clipped, chamfered, or edge-cut
-                     hexagons), not just the common 4-sided case
-
-These thresholds are heuristics. They were tuned against synthetic sample
-layouts (see generate_samples.py) since no real cassette DXF was available
-at build time -- validate/tune against real files in cassette_layouts/.
+A JSON sidecar (same basename as the DXF) provides metadata:
+  module type, i_rot, trigLinks, daqLinks, engine type, wagon names,
+  wingboard and motherboard identifiers.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import ezdxf
 from ezdxf.colors import aci2rgb
-from ezdxf.math import bulge_to_arc
 from shapely.geometry import Point, Polygon
-
-# ---------------------------------------------------------------------------
-# Tunables (see module docstring)
-# ---------------------------------------------------------------------------
-TILE_ANGLE_CENTER = 90.0
-TILE_ANGLE_TOLERANCE = 18.0
-TILE_MIN_SIDES = 4
-TILE_MAX_SIDES = 12
-
-HEX_ANGLE_CENTER = 120.0
-HEX_ANGLE_TOLERANCE = 16.0
-HEX_EDGE_RATIO_MAX = 1.45
-
-COLLINEAR_ANGLE_THRESHOLD = 165.0  # merge vertices whose corner is this straight
-ARC_SAMPLES_PER_BULGE = 8
-
-DEFAULT_COLOR_RGB = (148, 163, 184)  # slate-400, used when color can't be resolved
-
-ENGINES_LAYER = "ENGINES"
-MODULE_LABEL_COLOR = 250  # MTEXT dxf.color for module labels (code + (u,v))
-TRAIN_LABEL_COLOR = 0      # MTEXT dxf.color for train names (TL1, LD1, ...)
-REAL_TRAIN_LABEL_RE = re.compile(r"^(?:TL|TH|LD|HD)\d*$")
-
-
-@dataclass
-class Train:
-    """A readout train: a group of modules + engines sharing one fill color."""
-    id: str                       # stable key, e.g. "aci:246"
-    label: str                    # human name, e.g. "TL1" or "Train 1"; falls back to id
-    color_key: str
-    color_rgb: tuple[int, int, int]
 
 
 @dataclass
 class Module:
     id: str
-    polygon: list[tuple[float, float]]  # cleaned, closed-implied vertex loop
+    polygon: list[tuple[float, float]]
     shape: str  # "hex_full" | "hex_partial" | "tile"
     train_id: str
     color_key: str
     color_rgb: tuple[int, int, int]
-    code: str               # e.g. "M3", "E3", "W2", "G8"
-    uv: tuple[int, int] | None  # (u, v) coordinates parsed from the label, if present
-    label: str             # full original label text (may include the (u,v) line)
+    code: str
+    uv: tuple[int, int] | None
+    label: str
     centroid: tuple[float, float]
-    # JSON metadata (populated by _enrich_from_json)
-    module_type: str = ""          # e.g. "TM-G8RM", "ML-F3T"
+    module_type: str = ""
     i_rot: int | None = None
     trig_links: int | None = None
     daq_links: int | None = None
-    wagon_name: str = ""           # e.g. "WW11A1" or "WE30A3", when connected by a wagon
-
-
-@dataclass
-class WagonLink:
-    id: str
-    train_id: str
-    color_rgb: tuple[int, int, int]
-    name: str
-    from_point: tuple[float, float]
-    to_point: tuple[float, float]
-    label_point: tuple[float, float]
-    polygon: list[tuple[float, float]]
-    module_code: str
-    uv: tuple[int, int] | None
-
-
-@dataclass
-class Wingboard:
-    id: str
-    train_id: str
-    name: str
-    module_id: str
-    module_code: str
-    polygon: list[tuple[float, float]]
-    centroid: tuple[float, float]
-
-
-@dataclass
-class Motherboard:
-    id: str
-    train_id: str
-    name: str
-    center: tuple[float, float]
-    radius: float
+    is_wagon: bool = False
+    wagon_name: str = ""
+    wagon_side: str = ""  # "west" | "east" | "type"
+    module_num: int = 0   # numeric suffix for ordering (W1->1, E2->2, M3->3)
+    wingboard: str = ""
+    motherboard: str = ""
 
 
 @dataclass
@@ -160,8 +59,27 @@ class Engine:
     train_id: str
     color_key: str
     color_rgb: tuple[int, int, int]
-    # JSON metadata
-    engine_type: str = ""          # e.g. "EL10E0", "EH10H0"
+    engine_type: str = ""
+    motherboard: str = ""
+
+
+@dataclass
+class Wingboard:
+    id: str
+    train_id: str
+    polygon: list[tuple[float, float]]
+    centroid: tuple[float, float]
+    wingboard_name: str = ""
+
+
+@dataclass
+class Train:
+    id: str
+    label: str
+    color_key: str
+    color_rgb: tuple[int, int, int]
+    is_real: bool = True   # True for TL/TH/LD/HD, False for "Train N"
+    density: str = ""      # "HD" | "LD" | ""
 
 
 @dataclass
@@ -169,780 +87,367 @@ class CassetteModel:
     name: str
     modules: list[Module] = field(default_factory=list)
     engines: list[Engine] = field(default_factory=list)
-    wagon_links: list[WagonLink] = field(default_factory=list)
     wingboards: list[Wingboard] = field(default_factory=list)
-    motherboards: list[Motherboard] = field(default_factory=list)
     trains: list[Train] = field(default_factory=list)
     bounds: tuple[float, float, float, float] = (0, 0, 1, 1)
-    wagons_visible: bool = True
+    real_train_count: int = 0
 
 
-@dataclass
-class CassetteSummary:
-    cassette_type: str  # "Pure silicon" | "Mixed"
-    full_hex: int
-    partial_hex: int
-    tile: int
-    trains: int
-    engines: int
-    wingboards: int
-    motherboards: int
-
-
-# ---------------------------------------------------------------------------
-# Geometry helpers
-# ---------------------------------------------------------------------------
-def _flatten_lwpolyline(points_xyb: list[tuple[float, float, float]], closed: bool) -> list[tuple[float, float]]:
-    """Flatten a LWPOLYLINE's (x, y, bulge) vertices into a plain point loop,
-    replacing bulge segments with sampled arc points."""
-    pts: list[tuple[float, float]] = []
-    n = len(points_xyb)
-    if n == 0:
-        return pts
-
-    segment_count = n if closed else n - 1
-    for i in range(n):
-        x, y, bulge = points_xyb[i]
-        pts.append((x, y))
-        if i >= segment_count:
-            continue
-        if abs(bulge) > 1e-9:
-            nxt = points_xyb[(i + 1) % n]
-            try:
-                center, start_angle, end_angle, radius = bulge_to_arc((x, y), (nxt[0], nxt[1]), bulge)
-            except Exception:
-                continue
-            sweep = end_angle - start_angle
-            while sweep <= 0:
-                sweep += 2 * math.pi
-            for s in range(1, ARC_SAMPLES_PER_BULGE):
-                t = start_angle + sweep * (s / ARC_SAMPLES_PER_BULGE)
-                pts.append((center[0] + radius * math.cos(t), center[1] + radius * math.sin(t)))
-    return pts
-
-
-def _dedupe_points(points: list[tuple[float, float]], tol: float = 1e-6) -> list[tuple[float, float]]:
-    out: list[tuple[float, float]] = []
-    for p in points:
-        if not out or math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > tol:
-            out.append(p)
-    if len(out) > 1 and math.hypot(out[0][0] - out[-1][0], out[0][1] - out[-1][1]) <= tol:
-        out.pop()
-    return out
-
-
-def _interior_angle(p0, p1, p2) -> float:
-    v1 = (p0[0] - p1[0], p0[1] - p1[1])
-    v2 = (p2[0] - p1[0], p2[1] - p1[1])
-    n1 = math.hypot(*v1)
-    n2 = math.hypot(*v2)
-    if n1 < 1e-9 or n2 < 1e-9:
-        return 180.0
-    dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
-    dot = max(-1.0, min(1.0, dot))
-    return math.degrees(math.acos(dot))
-
-
-def _simplify_polygon(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Remove near-duplicate and near-collinear vertices so vertex count
-    reflects the shape's actual corner count."""
-    pts = _dedupe_points(points)
-    if len(pts) < 4:
-        return pts
-    changed = True
-    while changed and len(pts) > 3:
-        changed = False
-        n = len(pts)
-        for i in range(n):
-            p0, p1, p2 = pts[(i - 1) % n], pts[i], pts[(i + 1) % n]
-            if _interior_angle(p0, p1, p2) >= COLLINEAR_ANGLE_THRESHOLD:
-                pts.pop(i)
-                changed = True
-                break
-    return pts
-
-
-def _edge_lengths(points: list[tuple[float, float]]) -> list[float]:
-    n = len(points)
-    return [math.hypot(points[(i + 1) % n][0] - points[i][0], points[(i + 1) % n][1] - points[i][1]) for i in range(n)]
-
-
-def classify_shape(points: list[tuple[float, float]]) -> str:
-    pts = _simplify_polygon(points)
-    n = len(pts)
-    if n < 3:
-        return "hex_partial"
-
-    angles = [_interior_angle(pts[(i - 1) % n], pts[i], pts[(i + 1) % n]) for i in range(n)]
-
-    if TILE_MIN_SIDES <= n <= TILE_MAX_SIDES and n % 2 == 0:
-        if all(abs(a - TILE_ANGLE_CENTER) <= TILE_ANGLE_TOLERANCE for a in angles):
-            return "tile"
-
-    if n == 6:
-        angles_ok = all(abs(a - HEX_ANGLE_CENTER) <= HEX_ANGLE_TOLERANCE for a in angles)
-        lengths = _edge_lengths(pts)
-        edge_ratio = max(lengths) / max(min(lengths), 1e-9)
-        if angles_ok and edge_ratio <= HEX_EDGE_RATIO_MAX:
-            return "hex_full"
-
-    return "hex_partial"
-
-
-def _centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
-    poly = Polygon(points)
-    if not poly.is_valid or poly.area == 0:
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        return (sum(xs) / len(xs), sum(ys) / len(ys))
-    c = poly.centroid
-    return (c.x, c.y)
-
-
-def _is_real_train_label(label: str) -> bool:
-    return bool(REAL_TRAIN_LABEL_RE.match(label.strip()))
-
-
-def _module_number(code: str) -> int:
-    match = re.search(r"(\d+)", code)
-    return int(match.group(1)) if match else 0
-
-
-def _bounds(points: list[tuple[float, float]]) -> tuple[float, float, float, float]:
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    return (min(xs), min(ys), max(xs), max(ys))
-
-
-def _segment_rect(
-    p0: tuple[float, float],
-    p1: tuple[float, float],
-    width: float,
-) -> list[tuple[float, float]]:
-    dx = p1[0] - p0[0]
-    dy = p1[1] - p0[1]
-    length = math.hypot(dx, dy)
-    if length < 1e-6:
-        return []
-    nx = -dy / length * width / 2
-    ny = dx / length * width / 2
-    return [
-        (p0[0] + nx, p0[1] + ny),
-        (p1[0] + nx, p1[1] + ny),
-        (p1[0] - nx, p1[1] - ny),
-        (p0[0] - nx, p0[1] - ny),
-    ]
-
-
-def _angle_between(
-    origin: tuple[float, float],
-    a: tuple[float, float],
-    b: tuple[float, float],
-) -> float:
-    v1 = (a[0] - origin[0], a[1] - origin[1])
-    v2 = (b[0] - origin[0], b[1] - origin[1])
-    n1 = math.hypot(*v1)
-    n2 = math.hypot(*v2)
-    if n1 < 1e-6 or n2 < 1e-6:
-        return 0.0
-    dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
-    dot = max(-1.0, min(1.0, dot))
-    return math.degrees(math.acos(dot))
-
-
-def _typical_module_size(modules: list[Module]) -> float:
-    sizes = []
-    for m in modules:
-        minx, miny, maxx, maxy = _bounds(m.polygon)
-        sizes.append(min(maxx - minx, maxy - miny))
-    return sorted(sizes)[len(sizes) // 2] if sizes else 30.0
-
-
-def _wingboard_polygon(
-    module: Module,
-    train_center: tuple[float, float],
-    thickness: float,
-) -> list[tuple[float, float]]:
-    minx, miny, maxx, maxy = _bounds(module.polygon)
-    length = max((maxy - miny) * 0.82, thickness * 2.4)
-    cy = module.centroid[1]
-    y0 = cy - length / 2
-    y1 = cy + length / 2
-    place_right = module.centroid[0] >= train_center[0]
-    gap = thickness * 0.15
-    if place_right:
-        x0 = maxx + gap
-        x1 = x0 + thickness
-    else:
-        x1 = minx - gap
-        x0 = x1 - thickness
-    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-
-
-# ---------------------------------------------------------------------------
-# Color resolution
-# ---------------------------------------------------------------------------
-def _resolve_color(entity, doc) -> tuple[str, tuple[int, int, int]]:
-    """Return (stable_key, rgb) for an entity's effective color."""
-    true_color = entity.dxf.get("true_color", None)
-    if true_color is not None:
-        rgb = ((true_color >> 16) & 0xFF, (true_color >> 8) & 0xFF, true_color & 0xFF)
-        return f"true:{true_color}", rgb
-
-    aci = entity.dxf.get("color", 256)
-    if aci in (256, 0):  # BYLAYER / BYBLOCK -> resolve via layer
-        layer_name = entity.dxf.get("layer", "0")
-        layer = doc.layers.get(layer_name) if doc.layers.has_entry(layer_name) else None
-        if layer is not None:
-            layer_true_color = layer.dxf.get("true_color", None)
-            if layer_true_color is not None:
-                rgb = ((layer_true_color >> 16) & 0xFF, (layer_true_color >> 8) & 0xFF, layer_true_color & 0xFF)
-                return f"layer_true:{layer_true_color}", rgb
-            aci = layer.dxf.get("color", 7)
-        else:
-            aci = 7
-
+def _safe_aci2rgb(aci: int) -> tuple[int, int, int]:
     try:
-        rgb = aci2rgb(abs(aci))
+        rgb = aci2rgb(aci)
+        if rgb and len(rgb) >= 3:
+            return (rgb[0], rgb[1], rgb[2])
     except Exception:
-        rgb = DEFAULT_COLOR_RGB
-    return f"aci:{abs(aci)}", rgb
+        pass
+    return (128, 128, 128)
 
 
-# ---------------------------------------------------------------------------
-# Label parsing
-# ---------------------------------------------------------------------------
-def _parse_module_label(text: str) -> tuple[str, tuple[int, int] | None]:
-    """Split a module MTEXT body into (code, (u,v) | None).
-
-    The body is typically "M3\\n(3,2)" -- first line is the module code, the
-    optional second line is "(u,v)". Some cassettes only have the code line.
-    """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    code = lines[0] if lines else text.strip()
-    uv: tuple[int, int] | None = None
-    for ln in lines[1:]:
-        body = ln.strip("() ")
-        parts = [p.strip() for p in body.split(",")]
-        if len(parts) == 2:
-            try:
-                uv = (int(parts[0]), int(parts[1]))
-                break
-            except ValueError:
-                continue
+def _parse_module_code(label_text: str) -> tuple[str, tuple[int, int] | None]:
+    """Extract module code and (u,v) from MTEXT like 'G8\\n(4,6)'."""
+    lines = [ln.strip() for ln in label_text.replace("\\n", "\n").split("\n") if ln.strip()]
+    if not lines:
+        return ("", None)
+    code = lines[0]
+    uv = None
+    if len(lines) >= 2:
+        import re
+        m = re.match(r"\((\d+)\s*,\s*(\d+)\)", lines[1])
+        if m:
+            uv = (int(m.group(1)), int(m.group(2)))
     return code, uv
 
 
-# ---------------------------------------------------------------------------
-# Train registry
-# ---------------------------------------------------------------------------
-class _TrainRegistry:
-    """Collects trains by color_key, assigning sequential ids and labels."""
-
-    def __init__(self) -> None:
-        self._by_key: dict[str, Train] = {}
-        self._order: list[str] = []
-
-    def get_or_create(self, color_key: str, color_rgb: tuple[int, int, int]) -> Train:
-        if color_key in self._by_key:
-            return self._by_key[color_key]
-        idx = len(self._by_key) + 1
-        train = Train(
-            id=color_key,
-            label=f"Train {idx}",
-            color_key=color_key,
-            color_rgb=color_rgb,
-        )
-        self._by_key[color_key] = train
-        self._order.append(color_key)
-        return train
-
-    def all(self) -> list[Train]:
-        return [self._by_key[k] for k in self._order]
-
-    def try_assign_label(self, color_key: str, label: str) -> None:
-        train = self._by_key.get(color_key)
-        if train is None:
-            return
-        # keep the first non-default label we see
-        if train.label.startswith("Train "):
-            train.label = label
+def _module_number(code: str) -> int:
+    """Extract numeric suffix: W1->1, E2->2, M3->3, G8->8, B12->12."""
+    import re
+    m = re.search(r"(\d+)$", code)
+    return int(m.group(1)) if m else 0
 
 
-# ---------------------------------------------------------------------------
-# Main parse entrypoint
-# ---------------------------------------------------------------------------
+def _is_real_train(label: str) -> bool:
+    """Real trains: TL, TH, LD, HD. Not real: 'Train N'."""
+    return label[:2] in ("TL", "TH", "LD", "HD")
+
+
+def _train_density(label: str) -> str:
+    if label.startswith("HD"):
+        return "HD"
+    if label.startswith("LD"):
+        return "LD"
+    return ""
+
+
 def load_cassette(filepath: str, name: str) -> CassetteModel:
     doc = ezdxf.readfile(filepath)
     msp = doc.modelspace()
 
-    trains = _TrainRegistry()
-
-    # --- collect candidate module outlines from LWPOLYLINE ---
-    outlines = []
+    # --- Collect polylines (module shapes) grouped by ACI color ---
+    polyline_groups: dict[int, list] = {}
     for e in msp.query("LWPOLYLINE"):
-        if not e.closed:
+        if e.dxf.layer != "SHAPES":
             continue
-        raw = list(e.get_points("xyb"))
-        pts = _flatten_lwpolyline(raw, closed=True)
-        pts = _dedupe_points(pts)
-        if len(pts) < 3:
-            continue
-        poly = Polygon(pts)
-        if not poly.is_valid or poly.area <= 1e-6:
-            continue
-        outlines.append({"points": pts, "polygon": poly, "centroid": _centroid(pts)})
+        aci = e.dxf.get("color", 250)
+        pts = list(e.get_points("xy"))
+        if len(pts) >= 2 and pts[0] != pts[-1]:
+            pts.append(pts[0])
+        if len(pts) >= 4:
+            polyline_groups.setdefault(aci, []).append(pts)
 
-    # --- collect HATCH regions (color + a representative point) ---
-    hatches = []
-    for e in msp.query("HATCH"):
-        color_key, color_rgb = _resolve_color(e, doc)
-        # representative point: centroid of the first boundary path
-        rep_point = None
-        try:
-            for path in e.paths:
-                verts = None
-                if hasattr(path, "vertices") and path.vertices:
-                    verts = [(v[0], v[1]) for v in path.vertices]
-                elif hasattr(path, "edges"):
-                    verts = []
-                    for edge in path.edges:
-                        start = getattr(edge, "start", None)
-                        if start is not None:
-                            verts.append((start[0], start[1]))
-                if verts and len(verts) >= 3:
-                    rep_point = _centroid(verts)
-                    break
-        except Exception:
-            rep_point = None
-        if rep_point is None:
-            continue
-        hatches.append({"point": rep_point, "color_key": color_key, "color_rgb": color_rgb})
-
-    # --- match each hatch to the outline that contains it ---
-    outline_hatch: dict[int, dict] = {}
-    for h in hatches:
-        pt = Point(h["point"])
-        best_idx = None
-        best_dist = None
-        for idx, o in enumerate(outlines):
-            if o["polygon"].contains(pt) or o["polygon"].distance(pt) < 1e-6:
-                # contained: pick the smallest containing polygon (nested shapes safety)
-                dist = o["polygon"].area
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist
-                    best_idx = idx
-        if best_idx is None:
-            # fall back to nearest centroid within a reasonable radius
-            for idx, o in enumerate(outlines):
-                dist = pt.distance(Point(o["centroid"]))
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist
-                    best_idx = idx
-        if best_idx is not None:
-            outline_hatch[best_idx] = h
-            trains.get_or_create(h["color_key"], h["color_rgb"])
-
-    # --- collect MTEXT labels, split into module vs train labels ---
-    module_labels: list[dict] = []
-    train_label_points: list[dict] = []
+    # --- Collect MTEXT labels ---
+    mtext_entries = []
     for e in msp.query("MTEXT"):
-        insert = e.dxf.insert
         try:
-            text = e.plain_text()
+            text = e.plain_text().strip()
         except Exception:
-            text = e.text
-        text = text.strip()
+            text = e.text.strip()
         if not text:
             continue
         color = e.dxf.get("color", 256)
-        point = (insert[0], insert[1])
-        if color == TRAIN_LABEL_COLOR:
-            train_label_points.append({"point": point, "text": text})
-        else:
-            # treat everything else as a candidate module label (the canonical
-            # marker is color 250, but be lenient in case other cassettes vary)
-            module_labels.append({"point": point, "text": text})
-
-    # --- collect engines (CIRCLE on ENGINES layer) ---
-    engine_entries: list[dict] = []
-    for c in msp.query("CIRCLE"):
-        layer = c.dxf.get("layer", "")
-        if layer != ENGINES_LAYER:
-            continue
-        ctr = c.dxf.center
-        color_key, color_rgb = _resolve_color(c, doc)
-        engine_entries.append({
-            "center": (ctr[0], ctr[1]),
-            "radius": float(c.dxf.radius),
-            "color_key": color_key,
-            "color_rgb": color_rgb,
+        insert = e.dxf.get("insert", (0, 0))
+        mtext_entries.append({
+            "text": text,
+            "color": color,
+            "x": float(insert[0]),
+            "y": float(insert[1]),
         })
 
-    # Engines belong to the train whose color matches. If an engine's color
-    # doesn't match any existing train, register a new train for it (this can
-    # happen when an engine color has no hatched module, though in practice
-    # every engine color also appears as a hatch color in the sample files).
-    for eng in engine_entries:
-        trains.get_or_create(eng["color_key"], eng["color_rgb"])
-
-    # --- assign human-readable labels to trains ---
-    # Each train-label MTEXT (e.g. "TL1", "LD3") sits near one of the trains.
-    # We match labels to trains greedily: deduplicate the label texts, then for
-    # each unique label find the nearest module whose train hasn't been named
-    # yet. This avoids two labels collapsing onto the same train when they're
-    # clustered near modules of one color.
-    labeled_trains: set[str] = set()
-    seen_texts: set[str] = set()
-    for tl in train_label_points:
-        if tl["text"] in seen_texts:
+    # --- Collect engine circles ---
+    engine_entries = []
+    for e in msp.query("CIRCLE"):
+        if e.dxf.layer != "ENGINES":
             continue
-        seen_texts.add(tl["text"])
-        pt = Point(tl["point"])
-        best_idx = None
-        best_dist = None
-        for idx, o in enumerate(outlines):
-            if idx not in outline_hatch:
-                continue
-            train_id = outline_hatch[idx]["color_key"]
-            if train_id in labeled_trains:
-                continue
-            d = pt.distance(Point(o["centroid"]))
-            if best_dist is None or d < best_dist:
-                best_dist = d
-                best_idx = idx
-        if best_idx is not None:
-            train_id = outline_hatch[best_idx]["color_key"]
-            trains.try_assign_label(train_id, tl["text"])
-            labeled_trains.add(train_id)
-            continue
-        # fall back to nearest unlabelled engine
-        best_eng = None
-        best_eng_d = None
-        for eng in engine_entries:
-            if eng["color_key"] in labeled_trains:
-                continue
-            d = pt.distance(Point(eng["center"]))
-            if best_eng_d is None or d < best_eng_d:
-                best_eng_d = d
-                best_eng = eng
-        if best_eng is not None:
-            trains.try_assign_label(best_eng["color_key"], tl["text"])
-            labeled_trains.add(best_eng["color_key"])
+        center = e.dxf.center
+        radius = e.dxf.radius
+        aci = e.dxf.get("color", 1)
+        engine_entries.append({
+            "cx": float(center[0]),
+            "cy": float(center[1]),
+            "r": float(radius),
+            "aci": aci,
+        })
 
-    # --- build modules: only outlines with a matched hatch count as modules ---
+    # --- Identify train labels (color=0 MTEXT) ---
+    train_labels = []
+    for mt in mtext_entries:
+        if mt["color"] == 0:
+            train_labels.append(mt)
+
+    # --- Build trains from ACI color groups ---
+    # Match each ACI group to the nearest unused train label.
+    trains: list[Train] = []
+    train_id_by_aci: dict[int, str] = {}
+    available_labels = list(train_labels)
+    for aci in sorted(polyline_groups.keys()):
+        train_id = f"aci:{aci}"
+        rgb = _safe_aci2rgb(aci)
+        label = f"Train {len(trains) + 1}"
+        if available_labels:
+            first_pts = polyline_groups[aci][0]
+            cx = sum(p[0] for p in first_pts) / len(first_pts)
+            cy = sum(p[1] for p in first_pts) / len(first_pts)
+            best_idx = 0
+            best_dist = float("inf")
+            for i, t in enumerate(available_labels):
+                d = (t["x"] - cx) ** 2 + (t["y"] - cy) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+            label = available_labels.pop(best_idx)["text"]
+        is_real = _is_real_train(label)
+        density = _train_density(label)
+        trains.append(Train(
+            id=train_id, label=label, color_key=str(aci),
+            color_rgb=rgb, is_real=is_real, density=density,
+        ))
+        train_id_by_aci[aci] = train_id
+
+    # --- Build modules ---
     modules: list[Module] = []
-    for idx, o in enumerate(outlines):
-        hatch = outline_hatch.get(idx)
-        if hatch is None:
-            continue
-        shape = classify_shape(o["points"])
-        train = trains.get_or_create(hatch["color_key"], hatch["color_rgb"])
-
-        # find the module label whose insertion point falls inside this module
-        label_text = ""
-        code = ""
-        uv: tuple[int, int] | None = None
-        best_label_dist = None
-        for lab in module_labels:
-            pt = Point(lab["point"])
-            if o["polygon"].contains(pt):
-                label_text = lab["text"]
-                code, uv = _parse_module_label(lab["text"])
-                break
-            dist = pt.distance(Point(o["centroid"]))
-            if best_label_dist is None or dist < best_label_dist:
-                if o["polygon"].distance(pt) < max(o["polygon"].length * 0.05, 1e-6):
-                    best_label_dist = dist
-                    label_text = lab["text"]
-                    code, uv = _parse_module_label(lab["text"])
-
-        modules.append(
-            Module(
-                id=f"module-{idx}",
-                polygon=o["points"],
+    mod_counter = 0
+    for aci, polylines in polyline_groups.items():
+        train_id = train_id_by_aci[aci]
+        rgb = _safe_aci2rgb(aci)
+        for pts in polylines:
+            # Determine shape
+            n = len(pts) - 1  # last point == first
+            if n == 6:
+                shape = "hex_full"
+            elif n == 4:
+                shape = "tile"
+            else:
+                shape = "hex_partial"
+            # Centroid
+            poly = Polygon(pts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            cx, cy = poly.centroid.x, poly.centroid.y
+            # Find matching MTEXT (color=250, nearest to centroid)
+            code = ""
+            uv = None
+            best_dist = float("inf")
+            for mt in mtext_entries:
+                if mt["color"] != 250:
+                    continue
+                d = (mt["x"] - cx) ** 2 + (mt["y"] - cy) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    code, uv = _parse_module_code(mt["text"])
+            mod_counter += 1
+            modules.append(Module(
+                id=f"module-{mod_counter}",
+                polygon=pts,
                 shape=shape,
-                train_id=train.id,
-                color_key=hatch["color_key"],
-                color_rgb=hatch["color_rgb"],
-                code=code or f"Module {idx + 1}",
+                train_id=train_id,
+                color_key=str(aci),
+                color_rgb=rgb,
+                code=code,
                 uv=uv,
-                label=label_text or f"Module {idx + 1}",
-                centroid=o["centroid"],
-            )
-        )
+                label=f"{code}\n({uv[0]},{uv[1]})" if uv else code,
+                centroid=(cx, cy),
+                module_num=_module_number(code),
+            ))
 
-    # --- build engines ---
+    # --- Build engines ---
     engines: list[Engine] = []
     for i, eng in enumerate(engine_entries):
-        train = trains.get_or_create(eng["color_key"], eng["color_rgb"])
-        engines.append(
-            Engine(
-                id=f"engine-{i}",
-                center=eng["center"],
-                radius=eng["radius"],
-                train_id=train.id,
-                color_key=eng["color_key"],
-                color_rgb=eng["color_rgb"],
-            )
-        )
+        aci = eng["aci"]
+        rgb = _safe_aci2rgb(aci)
+        engines.append(Engine(
+            id=f"engine-{i}",
+            center=(eng["cx"], eng["cy"]),
+            radius=eng["r"],
+            train_id=f"aci:{aci}",
+            color_key=str(aci),
+            color_rgb=rgb,
+        ))
 
-    all_x = [p[0] for m in modules for p in m.polygon] + [e.center[0] for e in engines]
-    all_y = [p[1] for m in modules for p in m.polygon] + [e.center[1] for e in engines]
-    if not all_x:
-        all_x = [0, 1]
-    if not all_y:
-        all_y = [0, 1]
-    bounds = (min(all_x), min(all_y), max(all_x), max(all_y))
+    # --- Bounds ---
+    all_x = [p[0] for m in modules for p in m.polygon]
+    all_y = [p[1] for m in modules for p in m.polygon]
+    if engines:
+        all_x += [e.center[0] for e in engines]
+        all_y += [e.center[1] for e in engines]
+    if all_x and all_y:
+        bounds = (min(all_x), min(all_y), max(all_x), max(all_y))
+    else:
+        bounds = (0, 0, 1, 1)
 
     model = CassetteModel(
         name=name,
         modules=modules,
         engines=engines,
-        trains=trains.all(),
+        trains=trains,
         bounds=bounds,
     )
 
-    # Enrich modules and engines with JSON metadata if a sidecar file exists.
+    # --- Enrich from JSON sidecar ---
     json_path = Path(filepath).with_suffix(".json")
     if json_path.exists():
         _enrich_from_json(model, json_path)
 
-    overlay_x = (
-        [p[0] for w in model.wagon_links for p in w.polygon]
-        + [p[0] for wb in model.wingboards for p in wb.polygon]
-        + [mb.center[0] - mb.radius for mb in model.motherboards]
-        + [mb.center[0] + mb.radius for mb in model.motherboards]
-    )
-    overlay_y = (
-        [p[1] for w in model.wagon_links for p in w.polygon]
-        + [p[1] for wb in model.wingboards for p in wb.polygon]
-        + [mb.center[1] - mb.radius for mb in model.motherboards]
-        + [mb.center[1] + mb.radius for mb in model.motherboards]
-    )
-    if overlay_x and overlay_y:
-        model.bounds = (
-            min(model.bounds[0], min(overlay_x)),
-            min(model.bounds[1], min(overlay_y)),
-            max(model.bounds[2], max(overlay_x)),
-            max(model.bounds[3], max(overlay_y)),
-        )
+    # --- Count real trains ---
+    model.real_train_count = sum(1 for t in model.trains if t.is_real)
+
+    # --- Build wingboards ---
+    _build_wingboards(model)
 
     return model
 
 
 def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
-    """Load the JSON sidecar and annotate each Module/Engine with its metadata.
-
-    JSON layout: { cassette_half: { train_name: { module_code: { type, i_rot,
-    trigLinks, daqLinks }, "engine": { type }, "wagon_west": str,
-    "wagon_east": str, "wagon_type": str } } }
-
-    Matching strategy:
-      1. The JSON may describe one or both cassette halves (top-level keys like
-         "44C", "18C", "7B", "33B").
-      2. Within each half, sub-keys are train labels ("TL1", "LD2", "HD1", …).
-      3. Module codes inside a train entry are matched to Module.code after
-         stripping the (u,v) text — the code must appear in both the DXF label
-         and the JSON.
-    """
     try:
         with open(json_path) as f:
             raw = json.load(f)
     except Exception:
         return
 
-    # Flatten all halves into one dict: { train_label: train_entry }
+    # Flatten all halves: { train_label: train_entry }
     train_entries: dict[str, dict] = {}
     for half_data in raw.values():
         if isinstance(half_data, dict):
             train_entries.update(half_data)
 
-    # Build lookup: train_label -> train_id (from model.trains)
     label_to_train_id = {t.label: t.id for t in model.trains}
 
-    # Build lookup: (train_id, code) -> Module
+    # Build module lookup: (train_id, code) -> Module
     module_lookup: dict[tuple[str, str], Module] = {}
     for m in model.modules:
         module_lookup[(m.train_id, m.code)] = m
-
-    train_by_id = {t.id: t for t in model.trains}
-    default_board_radius = max((e.radius for e in model.engines), default=15.0)
-    module_size = _typical_module_size(model.modules)
-    wagon_width = max(module_size * 0.22, default_board_radius * 0.75)
-    board_width = max(default_board_radius * 1.55, module_size * 0.18)
 
     for train_label, train_entry in train_entries.items():
         if not isinstance(train_entry, dict):
             continue
         train_id = label_to_train_id.get(train_label)
-
-        # Collect wagon name(s) for this train entry.
-        wagon_west = train_entry.get("wagon_west", "")
-        wagon_east = train_entry.get("wagon_east", "")
-        wagon_type = train_entry.get("wagon_type", "")
-
-        for key, value in train_entry.items():
-            if key in ("engine", "wagon_west", "wagon_east", "wagon_type", "wingboard", "motherboard"):
-                continue
-            if not isinstance(value, dict):
-                continue
-
-            # --- module enrichment ---
-            if train_id is not None:
-                mod = module_lookup.get((train_id, key))
-                if mod is not None:
-                    mod.module_type = value.get("type", "")
-                    mod.i_rot = value.get("i_rot")
-                    mod.trig_links = value.get("trigLinks")
-                    mod.daq_links = value.get("daqLinks")
-                    if key.startswith("W") and (wagon_west or wagon_type):
-                        mod.wagon_name = wagon_west or wagon_type
-                    elif key.startswith("E") and (wagon_east or wagon_type):
-                        mod.wagon_name = wagon_east or wagon_type
-                    elif wagon_type:
-                        mod.wagon_name = wagon_type
-
         if train_id is None:
             continue
 
-        train_mods = [mod for mod in model.modules if mod.train_id == train_id]
-        if not train_mods:
-            continue
-        train_center = (
-            sum(mod.centroid[0] for mod in train_mods) / len(train_mods),
-            sum(mod.centroid[1] for mod in train_mods) / len(train_mods),
-        )
+        wagon_west = train_entry.get("wagon_west", "")
+        wagon_east = train_entry.get("wagon_east", "")
+        wagon_type = train_entry.get("wagon_type", "")
+        wingboard = train_entry.get("wingboard", "")
+        motherboard = train_entry.get("motherboard", "")
 
-        # --- engine enrichment ---
+        for key, value in train_entry.items():
+            if key in ("engine", "wagon_west", "wagon_east", "wagon_type",
+                       "wingboard", "motherboard"):
+                continue
+            if not isinstance(value, dict):
+                continue
+            mod = module_lookup.get((train_id, key))
+            if mod is None:
+                continue
+            mod.module_type = value.get("type", "")
+            mod.i_rot = value.get("i_rot")
+            mod.trig_links = value.get("trigLinks")
+            mod.daq_links = value.get("daqLinks")
+            mod.wingboard = wingboard
+            mod.motherboard = motherboard
+
+            # Wagon detection
+            if key.startswith("W") and (wagon_west or wagon_type):
+                mod.is_wagon = True
+                mod.wagon_name = wagon_west or wagon_type
+                mod.wagon_side = "west" if wagon_west else "type"
+            elif key.startswith("E") and (wagon_east or wagon_type):
+                mod.is_wagon = True
+                mod.wagon_name = wagon_east or wagon_type
+                mod.wagon_side = "east" if wagon_east else "type"
+            elif wagon_type and not key.startswith(("W", "E")):
+                mod.is_wagon = True
+                mod.wagon_name = wagon_type
+                mod.wagon_side = "type"
+
+        # --- Engine enrichment by proximity ---
         eng_entry = train_entry.get("engine")
         if isinstance(eng_entry, dict):
             eng_type = eng_entry.get("type", "")
-            # Engines all land on a generic ACI color so their train_id from
-            # DXF is unreliable. Match by proximity: find the untyped engine
-            # whose center is closest to the centroid of this train's modules.
-            untyped = [e for e in model.engines if not e.engine_type]
-            if untyped:
-                best = min(untyped, key=lambda e: (e.center[0]-train_center[0])**2 + (e.center[1]-train_center[1])**2)
-                best.engine_type = eng_type
-                best.train_id = train_id
-
-        motherboard = train_entry.get("motherboard", "")
-        if motherboard:
-            untyped = [e for e in model.engines if not e.engine_type]
-            if untyped:
-                best = min(untyped, key=lambda e: (e.center[0]-train_center[0])**2 + (e.center[1]-train_center[1])**2)
-                best.engine_type = motherboard
-                best.train_id = train_id
-                model.motherboards.append(
-                    Motherboard(
-                        id=f"motherboard-{len(model.motherboards)}",
-                        train_id=train_id,
-                        name=motherboard,
-                        center=best.center,
-                        radius=best.radius,
-                    )
-                )
-
-        wingboard = train_entry.get("wingboard", "")
-        if wingboard:
-            for mod in train_mods:
-                if mod.shape != "tile" or not mod.code.startswith(("E", "G")):
-                    continue
-                polygon = _wingboard_polygon(mod, train_center, board_width)
-                model.wingboards.append(
-                    Wingboard(
-                        id=f"wingboard-{len(model.wingboards)}",
-                        train_id=train_id,
-                        name=wingboard,
-                        module_id=mod.id,
-                        module_code=mod.code,
-                        polygon=polygon,
-                        centroid=_centroid(polygon),
-                    )
-                )
-
-        engine_center = None
-        typed_engines = [e for e in model.engines if e.train_id == train_id and e.engine_type]
-        if typed_engines:
-            engine_center = min(
-                typed_engines,
-                key=lambda e: (e.center[0]-train_center[0])**2 + (e.center[1]-train_center[1])**2,
-            ).center
-
-        if engine_center is not None and (wagon_west or wagon_east or wagon_type):
-            modules_by_code = {mod.code: mod for mod in train_mods}
-            groups: dict[str, list[Module]] = {}
-            for key, value in train_entry.items():
-                if not isinstance(value, dict) or key not in modules_by_code:
-                    continue
-                prefix = key[:1]
-                groups.setdefault(prefix, []).append(modules_by_code[key])
-
-            for prefix, group_mods in groups.items():
-                group_mods.sort(key=lambda mod: _module_number(mod.code))
-                if not group_mods:
-                    continue
-                wagon_name = wagon_type
-                if prefix == "W":
-                    wagon_name = wagon_west or wagon_type
-                elif prefix == "E":
-                    wagon_name = wagon_east or wagon_type
-                if not wagon_name:
-                    continue
-
-                connections: list[tuple[tuple[float, float], Module]] = [(engine_center, group_mods[0])]
-                if len(group_mods) >= 3:
-                    angle = _angle_between(group_mods[0].centroid, group_mods[1].centroid, group_mods[2].centroid)
-                    if angle >= 30.0:
-                        connections.append((group_mods[0].centroid, group_mods[1]))
-                        connections.append((group_mods[0].centroid, group_mods[2]))
-                        for idx in range(3, len(group_mods)):
-                            connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
-                    else:
-                        for idx in range(1, len(group_mods)):
-                            connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
-                else:
-                    for idx in range(1, len(group_mods)):
-                        connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
-
-                train = train_by_id.get(train_id)
-                color_rgb = train.color_rgb if train is not None else DEFAULT_COLOR_RGB
-                for start, mod in connections:
-                    end = mod.centroid
-                    polygon = _segment_rect(start, end, wagon_width)
-                    if not polygon:
-                        continue
-                    label_point = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
-                    model.wagon_links.append(
-                        WagonLink(
-                            id=f"wagon-{len(model.wagon_links)}",
-                            train_id=train_id,
-                            color_rgb=color_rgb,
-                            name=wagon_name,
-                            from_point=start,
-                            to_point=end,
-                            label_point=label_point,
-                            polygon=polygon,
-                            module_code=mod.code,
-                            uv=mod.uv,
-                        )
-                    )
+            train_mods = [m for m in model.modules if m.train_id == train_id]
+            if train_mods:
+                cx = sum(m.centroid[0] for m in train_mods) / len(train_mods)
+                cy = sum(m.centroid[1] for m in train_mods) / len(train_mods)
+                untyped = [e for e in model.engines if not e.engine_type]
+                if untyped:
+                    best = min(untyped, key=lambda e: (e.center[0] - cx) ** 2 + (e.center[1] - cy) ** 2)
+                    best.engine_type = eng_type
+                    best.train_id = train_id
+                    best.motherboard = motherboard
 
 
-def summarize(model: CassetteModel) -> CassetteSummary:
-    full_hex = sum(1 for m in model.modules if m.shape == "hex_full")
-    partial_hex = sum(1 for m in model.modules if m.shape == "hex_partial")
-    tile = sum(1 for m in model.modules if m.shape == "tile")
-    trains = sum(1 for t in model.trains if _is_real_train_label(t.label))
-    cassette_type = "Mixed" if tile > 0 else "Pure silicon"
-    return CassetteSummary(
-        cassette_type=cassette_type,
-        full_hex=full_hex,
-        partial_hex=partial_hex,
-        tile=tile,
-        trains=trains,
-        engines=len(model.engines),
-        wingboards=len(model.wingboards),
-        motherboards=len(model.motherboards),
-    )
+def _build_wingboards(model: CassetteModel) -> None:
+    """Build wingboard rectangles at the boundary of E and G type tile modules.
+
+    Wingboards are longer rectangular blocks placed at the outer edge of
+    E-type and G-type modules (the first and last modules in TL/TH trains).
+    Width is slightly smaller than the engine circle diameter.
+    """
+    if not model.engines:
+        return
+
+    # Engine radius for sizing
+    avg_radius = sum(e.radius for e in model.engines) / max(len(model.engines), 1)
+    wb_width = avg_radius * 2 * 0.8  # slightly smaller than engine circle diameter
+    wb_length = avg_radius * 3.0     # longer rectangular block
+
+    for train in model.trains:
+        if not train.is_real:
+            continue
+        train_mods = [m for m in model.modules if m.train_id == train.id]
+        if not train_mods:
+            continue
+        # Find E-type and G-type modules (codes starting with E or G)
+        for mod in train_mods:
+            if not mod.code.startswith(("E", "G")):
+                continue
+            # Place wingboard at the outer edge of the module
+            cx, cy = mod.centroid
+            # Determine outer direction: away from train centroid
+            train_cx = sum(m.centroid[0] for m in train_mods) / len(train_mods)
+            train_cy = sum(m.centroid[1] for m in train_mods) / len(train_mods)
+            dx = cx - train_cx
+            dy = cy - train_cy
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < 1e-6:
+                continue
+            # Offset position: move outward from train center past the module edge
+            offset = 50.0  # offset beyond module boundary
+            wb_cx = cx + (dx / dist) * offset
+            wb_cy = cy + (dy / dist) * offset
+            # Build rectangle perpendicular to the outward direction
+            perp_x = -dy / dist
+            perp_y = dx / dist
+            half_l = wb_length / 2
+            half_w = wb_width / 2
+            p1 = (wb_cx + perp_x * half_l, wb_cy + perp_y * half_l)
+            p2 = (wb_cx - perp_x * half_l, wb_cy - perp_y * half_l)
+            p3 = (wb_cx - perp_x * half_l - (dx / dist) * wb_width,
+                  wb_cy - perp_y * half_l - (dy / dist) * wb_width)
+            p4 = (wb_cx + perp_x * half_l - (dx / dist) * wb_width,
+                  wb_cy + perp_y * half_l - (dy / dist) * wb_width)
+            model.wingboards.append(Wingboard(
+                id=f"wb-{train.id}-{mod.code}",
+                train_id=train.id,
+                polygon=[p1, p2, p3, p4],
+                centroid=(wb_cx, wb_cy),
+                wingboard_name=mod.wingboard,
+            ))
