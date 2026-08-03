@@ -355,6 +355,8 @@ state = {
     "test_svg_file": None,    # path to temp .svg for the test-results view
     "test_svg_history": [],    # list of temp .svg file paths from each test run
     "test_svg_index": -1,     # current index in test_svg_history
+    "test_toggle_left": None,  # ui.Button for test-history nav (created dynamically)
+    "test_toggle_right": None,
 }
 
 with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
@@ -659,20 +661,24 @@ def _render_view() -> None:
 
 def _update_toggle_buttons() -> None:
     """Update the test-history arrow buttons based on test_svg_history."""
+    tl = state.get("test_toggle_left")
+    tr = state.get("test_toggle_right")
+    if tl is None or tr is None:
+        return
     history = state.get("test_svg_history", [])
     idx = state.get("test_svg_index", -1)
     if not history or idx < 0:
-        test_toggle_left.props("disabled")
-        test_toggle_right.props("disabled")
+        tl.props("disabled")
+        tr.props("disabled")
         return
     if idx > 0:
-        test_toggle_left.props(remove="disabled")
+        tl.props(remove="disabled")
     else:
-        test_toggle_left.props("disabled")
+        tl.props("disabled")
     if idx < len(history) - 1:
-        test_toggle_right.props(remove="disabled")
+        tr.props(remove="disabled")
     else:
-        test_toggle_right.props("disabled")
+        tr.props("disabled")
 
 
 def _on_test_toggle_left() -> None:
@@ -848,14 +854,14 @@ def load_selected(name: str) -> None:
             ).classes("green-background flex-1")
             # Test-history navigation: arrow buttons to browse through
             # previously generated test SVGs.
-            test_toggle_left = ui.button(icon="arrow_back").props(
+            state["test_toggle_left"] = ui.button(icon="arrow_back").props(
                 "flat round dense color=blue-grey-4"
             ).props("disabled").tooltip("Previous test result")
-            test_toggle_right = ui.button(icon="arrow_forward").props(
+            state["test_toggle_right"] = ui.button(icon="arrow_forward").props(
                 "flat round dense color=blue-grey-4"
             ).props("disabled").tooltip("Next test result")
-            test_toggle_left.on_click(_on_test_toggle_left)
-            test_toggle_right.on_click(_on_test_toggle_right)
+            state["test_toggle_left"].on_click(_on_test_toggle_left)
+            state["test_toggle_right"].on_click(_on_test_toggle_right)
 
 
 # Register the input callback last, after run_button and all handler
