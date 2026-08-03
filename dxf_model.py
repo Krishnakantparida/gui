@@ -96,6 +96,7 @@ class Train:
     label: str                    # human name, e.g. "TL1" or "Train 1"; falls back to id
     color_key: str
     color_rgb: tuple[int, int, int]
+    density: str = ""             # "HD" | "LD" | ""
 
 
 @dataclass
@@ -162,6 +163,8 @@ class Engine:
     color_rgb: tuple[int, int, int]
     # JSON metadata
     engine_type: str = ""          # e.g. "EL10E0", "EH10H0"
+    motherboard: str = ""         # e.g. "MB-44C-TL1"
+    density: str = ""             # "HD" | "LD" | ""
 
 
 @dataclass
@@ -301,6 +304,16 @@ def _centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
 
 def _is_real_train_label(label: str) -> bool:
     return bool(REAL_TRAIN_LABEL_RE.match(label.strip()))
+
+
+def _train_density(label: str) -> str:
+    """Derive 'HD' or 'LD' from a train label like 'HD1', 'LD3', 'TL2'."""
+    s = label.strip().upper()
+    if s.startswith("HD"):
+        return "HD"
+    if s.startswith("LD"):
+        return "LD"
+    return ""
 
 
 def _module_number(code: str) -> int:
@@ -757,7 +770,7 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
     default_board_radius = max((e.radius for e in model.engines), default=15.0)
     module_size = _typical_module_size(model.modules)
     wagon_width = max(module_size * 0.22, default_board_radius * 0.75)
-    board_width = max(default_board_radius * 1.55, module_size * 0.18)
+    board_width = max(default_board_radius * 0.85, module_size * 0.10)
 
     for train_label, train_entry in train_entries.items():
         if not isinstance(train_entry, dict):
@@ -801,18 +814,22 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
             sum(mod.centroid[1] for mod in train_mods) / len(train_mods),
         )
 
+        density = _train_density(train_label)
+        if train_id is not None:
+            tr = train_by_id.get(train_id)
+            if tr is not None:
+                tr.density = density
+
         # --- engine enrichment ---
         eng_entry = train_entry.get("engine")
         if isinstance(eng_entry, dict):
             eng_type = eng_entry.get("type", "")
-            # Engines all land on a generic ACI color so their train_id from
-            # DXF is unreliable. Match by proximity: find the untyped engine
-            # whose center is closest to the centroid of this train's modules.
             untyped = [e for e in model.engines if not e.engine_type]
             if untyped:
                 best = min(untyped, key=lambda e: (e.center[0]-train_center[0])**2 + (e.center[1]-train_center[1])**2)
                 best.engine_type = eng_type
                 best.train_id = train_id
+                best.density = density
 
         motherboard = train_entry.get("motherboard", "")
         if motherboard:
@@ -820,7 +837,9 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
             if untyped:
                 best = min(untyped, key=lambda e: (e.center[0]-train_center[0])**2 + (e.center[1]-train_center[1])**2)
                 best.engine_type = motherboard
+                best.motherboard = motherboard
                 best.train_id = train_id
+                best.density = density
                 model.motherboards.append(
                     Motherboard(
                         id=f"motherboard-{len(model.motherboards)}",
@@ -834,7 +853,7 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
         wingboard = train_entry.get("wingboard", "")
         if wingboard:
             for mod in train_mods:
-                if mod.shape != "tile" or not mod.code.startswith(("E")):
+                if not mod.code.startswith(("E")):
                     continue
                 polygon = _wingboard_polygon(mod, train_center, board_width)
                 model.wingboards.append(
@@ -866,6 +885,9 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
                 prefix = key[:1]
                 groups.setdefault(prefix, []).append(modules_by_code[key])
 
+            train = train_by_id.get(train_id)
+            color_rgb = train.color_rgb if train is not None else DEFAULT_COLOR_RGB
+
             for prefix, group_mods in groups.items():
                 group_mods.sort(key=lambda mod: _module_number(mod.code))
                 if not group_mods:
@@ -878,24 +900,47 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
                 if not wagon_name:
                     continue
 
-                connections: list[tuple[tuple[float, float], Module]] = [(engine_center, group_mods[0])]
-                if len(group_mods) >= 3:
-                    angle = _angle_between(group_mods[0].centroid, group_mods[1].centroid, group_mods[2].centroid)
-                    if angle >= 30.0:
-                        connections.append((group_mods[0].centroid, group_mods[1]))
-                        connections.append((group_mods[0].centroid, group_mods[2]))
-                        for idx in range(3, len(group_mods)):
-                            connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
-                    else:
-                        for idx in range(1, len(group_mods)):
-                            connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
-                else:
-                    for idx in range(1, len(group_mods)):
-                        connections.append((group_mods[idx - 1].centroid, group_mods[idx]))
+                # Generalized wagon linking via Prim's MST.
+                # Nodes: engine_center + all modules in this group.
+                # Edges: every pairwise distance (complete graph).
+                # The MST connects every module (including partials) with
+                # the minimum total link length, naturally handling linear
+                # chains, branched layouts (E3 adj E1, W1 adj W3, M2 adj M4),
+                # and cross-connections -- all within the same train.
+                nodes = [engine_center] + [m.centroid for m in group_mods]
+                node_mods = [None] + group_mods  # nodes[0] = engine (no module)
+                n = len(nodes)
+                if n < 2:
+                    continue
 
-                train = train_by_id.get(train_id)
-                color_rgb = train.color_rgb if train is not None else DEFAULT_COLOR_RGB
-                for start, mod in connections:
+                # Prim's algorithm
+                in_tree = [False] * n
+                in_tree[0] = True
+                edges: list[tuple[int, int]] = []
+                for _ in range(n - 1):
+                    best_d = float('inf')
+                    best_i = best_j = -1
+                    for i in range(n):
+                        if not in_tree[i]:
+                            continue
+                        for j in range(n):
+                            if in_tree[j]:
+                                continue
+                            d = (nodes[i][0] - nodes[j][0])**2 + (nodes[i][1] - nodes[j][1])**2
+                            if d < best_d:
+                                best_d = d
+                                best_i = i
+                                best_j = j
+                    if best_j == -1:
+                        break
+                    in_tree[best_j] = True
+                    edges.append((best_i, best_j))
+
+                for i, j in edges:
+                    start = nodes[i]
+                    mod = node_mods[j]
+                    if mod is None:
+                        continue
                     end = mod.centroid
                     polygon = _segment_rect(start, end, wagon_width)
                     if not polygon:

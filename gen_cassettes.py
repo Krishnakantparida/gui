@@ -59,7 +59,10 @@ def add_train(msp, train_label, aci_color, modules_spec, origin_x, origin_y,
             pts = hex_polygon(cx, cy)
         else:
             pts = tile_polygon(cx, cy)
-        msp.add_lwpolyline(pts + [pts[0]], dxfattribs={"layer": "SHAPES", "color": aci_color})
+        msp.add_lwpolyline(pts, dxfattribs={"layer": "SHAPES", "color": aci_color}, close=True)
+        # Add a HATCH inside the outline so dxf_model.py matches it as a module.
+        hatch = msp.add_hatch(color=aci_color, dxfattribs={"layer": "SHAPES"})
+        hatch.paths.add_polyline_path(pts, is_closed=True)
         msp.add_mtext(
             f"{code}\n({u},{v})",
             dxfattribs={"layer": "TEXT", "color": 250, "insert": (cx, cy)},

@@ -246,6 +246,38 @@ ui.add_head_html(
             else el.classList.add('dimmed');
         });
     }
+    function setBoardsVisible(visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        svg.querySelectorAll('.board-shape, .board-hit').forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
+    function setHDEnginesVisible(visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        svg.querySelectorAll('[data-engine-density="HD"]').forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
+    function setLDEnginesVisible(visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        svg.querySelectorAll('[data-engine-density="LD"]').forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
+    function setMotherboardsVisible(visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        svg.querySelectorAll('[data-motherboard="true"]').forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
     </script>
     """
 )
@@ -311,12 +343,18 @@ state = {
     "model": None,            # last loaded CassetteModel
     "visible_trains": {},      # train_id -> bool (trains view)
     "engines_visible": True,
-    "wagons_visible": True,
+    "wagons_visible": False,
+    "wingboards_visible": True,
+    "motherboards_visible": True,
+    "hd_engines_visible": True,
+    "ld_engines_visible": True,
     "test_results": {},        # module.id -> bool (True = pass)
     "view_mode": "trains",     # "trains" | "test"
     "test_in_progress": False,
     "trains_svg_file": None,   # path to temp .svg for the trains view
     "test_svg_file": None,    # path to temp .svg for the test-results view
+    "test_svg_history": [],    # list of temp .svg file paths from each test run
+    "test_svg_index": -1,     # current index in test_svg_history
 }
 
 with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
@@ -368,15 +406,8 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
                     "text-sm text-gray-400"
                 )
 
-            # View-toggle arrow buttons pinned to the top-right corner. Hidden
-            # until a test has produced results to toggle between.
-            with ui.row().classes("view-toggle items-center") as toggle_container:
-                toggle_left = ui.button(icon="arrow_back").props(
-                    "flat round dense color=blue-grey-4"
-                ).props("disabled").tooltip("Show trains view")
-                toggle_right = ui.button(icon="arrow_forward").props(
-                    "flat round dense color=blue-grey-4"
-                ).props("disabled").tooltip("Show test-results view")
+            # View-toggle arrow buttons removed from cassette display --
+            # they now live in the test display beside the Run button.
 
             # Progress-bar overlay shown while a test is running.
             with ui.column().classes("progress-overlay") as progress_container:
@@ -441,12 +472,48 @@ def _render_legend(model) -> None:
                 swatch = f"rgb({r},{g},{b})"
                 ui.checkbox(
                     text="Engines",
-                    value=True,
+                    value=state["engines_visible"],
                     on_change=lambda e: _on_engines_toggle(e.value),
-                ).classes("flex-1").tooltip("Red circles on the ENGINES layer")
+                ).classes("flex-1").tooltip("Engine circles on the ENGINES layer")
                 ui.element("div").classes("legend-swatch engine").style(
                     f"background:{swatch};"
                 )
+            # Motherboards checkbox
+            has_motherboards = any(e.motherboard for e in model.engines)
+            if has_motherboards:
+                with ui.row().classes("legend-row w-full items-center"):
+                    ui.checkbox(
+                        text="Motherboards",
+                        value=state["motherboards_visible"],
+                        on_change=lambda e: _on_motherboards_toggle(e.value),
+                    ).classes("flex-1").tooltip("Motherboard info overlaid on engines")
+                    ui.element("div").classes("legend-swatch engine").style(
+                        "background:#a78bfa;"
+                    )
+            # HD Engines checkbox
+            hd_engines = [e for e in model.engines if e.density == "HD"]
+            if hd_engines:
+                with ui.row().classes("legend-row w-full items-center"):
+                    ui.checkbox(
+                        text="HD Engines",
+                        value=state["hd_engines_visible"],
+                        on_change=lambda e: _on_hd_engines_toggle(e.value),
+                    ).classes("flex-1").tooltip("High Density silicon module engines")
+                    ui.element("div").classes("legend-swatch engine").style(
+                        "background:#f97316;"
+                    )
+            # LD Engines checkbox
+            ld_engines = [e for e in model.engines if e.density == "LD"]
+            if ld_engines:
+                with ui.row().classes("legend-row w-full items-center"):
+                    ui.checkbox(
+                        text="LD Engines",
+                        value=state["ld_engines_visible"],
+                        on_change=lambda e: _on_ld_engines_toggle(e.value),
+                    ).classes("flex-1").tooltip("Low Density silicon module engines")
+                    ui.element("div").classes("legend-swatch engine").style(
+                        "background:#3b82f6;"
+                    )
         has_wagons = bool(model.wagon_links)
         if has_wagons:
             ui.separator().classes("w-full")
@@ -458,6 +525,18 @@ def _render_legend(model) -> None:
                 ).classes("flex-1").tooltip("Dashed wagon connector overlays")
                 ui.element("div").classes("legend-swatch wagon").style(
                     "background:rgba(148,163,184,0.45);border-style:dashed;"
+                )
+        # Wingboards just below wagons
+        if model.wingboards:
+            ui.separator().classes("w-full")
+            with ui.row().classes("legend-row w-full items-center"):
+                ui.checkbox(
+                    text="Wingboards",
+                    value=state["wingboards_visible"],
+                    on_change=lambda e: _on_wingboards_toggle(e.value),
+                ).classes("flex-1").tooltip("Wingboard blocks at E/G module boundaries")
+                ui.element("div").classes("legend-swatch wingboard").style(
+                    "background:rgba(56,189,248,0.42);border-style:dashed;border-color:#e0f2fe;"
                 )
 
 
@@ -495,6 +574,30 @@ def _on_wagons_toggle(visible: bool) -> None:
     state["wagons_visible"] = visible
     v = "true" if visible else "false"
     ui.run_javascript(f"setWagonsVisible({v});")
+
+
+def _on_wingboards_toggle(visible: bool) -> None:
+    state["wingboards_visible"] = visible
+    v = "true" if visible else "false"
+    ui.run_javascript(f"setBoardsVisible({v});")
+
+
+def _on_motherboards_toggle(visible: bool) -> None:
+    state["motherboards_visible"] = visible
+    v = "true" if visible else "false"
+    ui.run_javascript(f"setMotherboardsVisible({v});")
+
+
+def _on_hd_engines_toggle(visible: bool) -> None:
+    state["hd_engines_visible"] = visible
+    v = "true" if visible else "false"
+    ui.run_javascript(f"setHDEnginesVisible({v});")
+
+
+def _on_ld_engines_toggle(visible: bool) -> None:
+    state["ld_engines_visible"] = visible
+    v = "true" if visible else "false"
+    ui.run_javascript(f"setLDEnginesVisible({v});")
 
 
 def _on_engines_toggle(visible: bool) -> None:
@@ -555,57 +658,51 @@ def _render_view() -> None:
 
 
 def _update_toggle_buttons() -> None:
-    has_results = bool(state["test_results"])
-    if not has_results:
-        toggle_left.props("disabled")
-        toggle_right.props("disabled")
+    """Update the test-history arrow buttons based on test_svg_history."""
+    history = state.get("test_svg_history", [])
+    idx = state.get("test_svg_index", -1)
+    if not history or idx < 0:
+        test_toggle_left.props("disabled")
+        test_toggle_right.props("disabled")
         return
-    if state["view_mode"] == "test":
-        toggle_left.props(remove="disabled")
-        toggle_right.props("disabled")
-    else:  # trains
-        toggle_left.props("disabled")
-        toggle_right.props(remove="disabled")
-
-
-def _on_toggle_left() -> None:
-    if state["view_mode"] != "test":
-        return
-    state["view_mode"] = "trains"
-    # Load the previously-saved trains SVG from its temp file instead of
-    # regenerating it from the model.
-    svg_file = state.get("trains_svg_file")
-    svg_content = _load_svg_temp(svg_file) if svg_file else None
-    if svg_content is not None:
-        _render_svg_content(svg_content)
-        model = state["model"]
-        if model is not None:
-            _render_legend(model)
+    if idx > 0:
+        test_toggle_left.props(remove="disabled")
     else:
-        _render_view()
+        test_toggle_left.props("disabled")
+    if idx < len(history) - 1:
+        test_toggle_right.props(remove="disabled")
+    else:
+        test_toggle_right.props("disabled")
+
+
+def _on_test_toggle_left() -> None:
+    """Navigate backward through test SVG history."""
+    history = state.get("test_svg_history", [])
+    idx = state.get("test_svg_index", -1)
+    if idx > 0:
+        state["test_svg_index"] = idx - 1
+        svg_content = _load_svg_temp(history[idx - 1])
+        if svg_content is not None:
+            _render_svg_content(svg_content)
+            model = state["model"]
+            if model is not None:
+                _render_test_legend(model, state["test_results"])
     _update_toggle_buttons()
 
 
-def _on_toggle_right() -> None:
-    if state["view_mode"] != "trains" or not state["test_results"]:
-        return
-    state["view_mode"] = "test"
-    # Load the previously-saved test-results SVG from its temp file instead
-    # of regenerating it from the model.
-    svg_file = state.get("test_svg_file")
-    svg_content = _load_svg_temp(svg_file) if svg_file else None
-    if svg_content is not None:
-        _render_svg_content(svg_content)
-        model = state["model"]
-        if model is not None:
-            _render_test_legend(model, state["test_results"])
-    else:
-        _render_view()
+def _on_test_toggle_right() -> None:
+    """Navigate forward through test SVG history."""
+    history = state.get("test_svg_history", [])
+    idx = state.get("test_svg_index", -1)
+    if idx < len(history) - 1:
+        state["test_svg_index"] = idx + 1
+        svg_content = _load_svg_temp(history[idx + 1])
+        if svg_content is not None:
+            _render_svg_content(svg_content)
+            model = state["model"]
+            if model is not None:
+                _render_test_legend(model, state["test_results"])
     _update_toggle_buttons()
-
-
-toggle_left.on_click(_on_toggle_left)
-toggle_right.on_click(_on_toggle_right)
 
 
 async def run_tests() -> None:
@@ -653,6 +750,12 @@ async def run_tests() -> None:
     # switch to the test-results view
     state["view_mode"] = "test"
     _render_view()
+
+    # Save this test SVG to history for arrow-button navigation
+    svg_file = state.get("test_svg_file")
+    if svg_file:
+        state["test_svg_history"].append(svg_file)
+        state["test_svg_index"] = len(state["test_svg_history"]) - 1
     _update_toggle_buttons()
 
     state["test_in_progress"] = False
@@ -712,7 +815,11 @@ def load_selected(name: str) -> None:
     state["model"] = model
     state["visible_trains"] = {t.id: True for t in model.trains}
     state["engines_visible"] = True
-    state["wagons_visible"] = True
+    state["wagons_visible"] = False
+    state["wingboards_visible"] = True
+    state["motherboards_visible"] = True
+    state["hd_engines_visible"] = True
+    state["ld_engines_visible"] = True
 
     summary = summarize(model)
     summary_table.rows = [
@@ -734,11 +841,21 @@ def load_selected(name: str) -> None:
     # cassette is fully loaded (table + display populated) -- enable the
     # run button so a test can be executed for this cassette.
     with dynamic_container:
-        with ui.row().classes("w-1/4 gap-2"):
+        with ui.row().classes("w-1/4 gap-2 items-center"):
             run_button = ui.button(
                 "▶ Run Cassette Test",
                 on_click=run_tests,
             ).classes("green-background flex-1")
+            # Test-history navigation: arrow buttons to browse through
+            # previously generated test SVGs.
+            test_toggle_left = ui.button(icon="arrow_back").props(
+                "flat round dense color=blue-grey-4"
+            ).props("disabled").tooltip("Previous test result")
+            test_toggle_right = ui.button(icon="arrow_forward").props(
+                "flat round dense color=blue-grey-4"
+            ).props("disabled").tooltip("Next test result")
+            test_toggle_left.on_click(_on_test_toggle_left)
+            test_toggle_right.on_click(_on_test_toggle_right)
 
 
 # Register the input callback last, after run_button and all handler
