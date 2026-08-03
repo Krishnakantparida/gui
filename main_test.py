@@ -1,222 +1,63 @@
-"""Interactive cassette viewer built with NiceGUI.
+"""NiceGUI GUI for the HGCAL single-cassette DXF tester.
 
-Features:
-  - DXF cassette loader with JSON sidecar metadata enrichment
-  - Interactive SVG display with hover tooltips (modules, wagons, engines,
-    wingboards, wagon connectors)
-  - Legend with per-train checkboxes, engines toggle, wagons toggle
-  - "Train N" labels replaced by engine representations in the legend
-  - Real train count (TL/TH/LD/HD only) shown in the info table
-  - Test runner with pass/fail SVG visualization
-  - Arrow buttons to switch between trains-view and test-results-view
-  - Dark/light theme toggle
+Enter a cassette name (the .dxf filename without extension) to load its
+layout: module footprints are classified (hexagonal / partial-hexagonal /
+tile) and grouped into "trains" by their fill color, and engines (the
+red circles on the ENGINES layer) are rendered alongside them. A
+checkbox legend -- overlaid in the top-left corner of the cassette
+display -- lets you toggle the visibility of each train (and the
+engines) in the interactive SVG. Hovering a module or engine reveals a
+tooltip with its details.
+
+Running a cassette test produces a second interactive display showing
+per-module Pass/Fail results (green/red); arrow buttons in the top-right
+corner of the display region toggle between the trains view and the
+test-results view.
 """
 
-from __future__ import annotations
-
-import os
+import random
 import tempfile
+import os
 from pathlib import Path
-
+import asyncio
 from nicegui import ui, app
 
-from dxf_model import load_cassette, CassetteModel
+from dxf_model import load_cassette, summarize
 from svg_builder import build_svg, build_test_svg
 
-CASSETTE_DIR = "cassette_layouts"
-
-state = {
-    "model": None,
-    "visible_trains": {},
-    "engines_visible": True,
-    "wagons_visible": True,
-    "test_results": {},
-    "view_mode": "trains",
-    "test_in_progress": False,
-    "trains_svg_file": None,
-    "test_svg_file": None,
-}
+CASSETTE_DIR = Path(__file__).parent / "cassette_layouts"
+CMS_LOGO = Path(__file__).parent / "standard_images" / "CMS_logo-002.png"
 
 
-def _get_cassette_files() -> list[str]:
-    d = Path(CASSETTE_DIR)
-    if not d.exists():
+def discover_cassettes() -> list[str]:
+    if not CASSETTE_DIR.exists():
         return []
-    return sorted(f.stem for f in d.glob("*.dxf"))
+    return sorted(p.stem for p in CASSETTE_DIR.glob("*.dxf"))
 
 
-def _hover_js() -> str:
-    return """
-    function cassetteHover(evt, text) {
-        var tt = document.getElementById('cassette-tooltip');
-        if (!tt) return;
-        tt.textContent = text;
-        tt.style.display = 'block';
-        tt.style.opacity = '1';
-        cassetteMove(evt);
+ui.add_css("""
+    @layer utilities {
+       .red-background {
+           background-color: red !important;
+           color: white !important;
+        }
+       .green-background {
+           background-color: green !important;
+           color: white !important;
+        }
+       .blue-background {
+           background-color: blue !important;
+           color: white !important;
+        }
+       .yellow-background {
+           background-color: yellow !important;
+           color: white !important;
+        }
     }
-    function cassetteMove(evt) {
-        var tt = document.getElementById('cassette-tooltip');
-        if (!tt) return;
-        var rect = tt.parentElement.getBoundingClientRect();
-        var x = evt.clientX - rect.left + 12;
-        var y = evt.clientY - rect.top + 12;
-        tt.style.left = x + 'px';
-        tt.style.top = y + 'px';
-    }
-    function cassetteLeave() {
-        var tt = document.getElementById('cassette-tooltip');
-        if (!tt) return;
-        tt.style.opacity = '0';
-        setTimeout(function() { if (tt) tt.style.display = 'none'; }, 200);
-    }
-    function setTrainVisible(trainId, visible) {
-        var svg = document.querySelector('.cassette-svg-wrap svg');
-        if (!svg) return;
-        var sel = '[data-train="' + CSS.escape(trainId) + '"]';
-        svg.querySelectorAll(sel).forEach(function(el) {
-            if (visible) el.classList.remove('dimmed');
-            else el.classList.add('dimmed');
-        });
-    }
-    function setWagonsVisible(visible) {
-        var svg = document.querySelector('.cassette-svg-wrap svg');
-        if (!svg) return;
-        svg.querySelectorAll('[data-wagon="true"]').forEach(function(el) {
-            if (visible) el.classList.remove('wagon-transparent');
-            else el.classList.add('wagon-transparent');
-        });
-    }
-    function setEnginesVisible(visible) {
-        var svg = document.querySelector('.cassette-svg-wrap svg');
-        if (!svg) return;
-        svg.querySelectorAll('.engine-shape, .engine-hit').forEach(function(el) {
-            if (visible) el.classList.remove('dimmed');
-            else el.classList.add('dimmed');
-        });
-    }
-    """
-
-
-def _css() -> str:
-    return """
-    <style>
-    .cassette-page {
-        background: #1e293b;
-        color: #e2e8f0;
-        min-height: 100vh;
-        font-family: 'Segoe UI', system-ui, sans-serif;
-    }
-    .cassette-page.light {
-        background: #f1f5f9;
-        color: #1e293b;
-    }
-    .cassette-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 16px 24px;
-        background: rgba(30,41,59,0.95);
-        border-bottom: 1px solid #334155;
-        position: sticky;
-        top: 0;
-        z-index: 100;
-    }
-    .cassette-page.light .cassette-header {
-        background: rgba(241,245,249,0.95);
-        border-bottom: 1px solid #cbd5e1;
-    }
-    .cassette-title {
-        font-size: 1.4rem;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-    }
-    .cassette-body {
-        display: flex;
-        gap: 0;
-        height: calc(100vh - 65px);
-    }
-    .cassette-sidebar {
-        width: 280px;
-        min-width: 280px;
-        background: rgba(15,23,42,0.6);
-        border-right: 1px solid #334155;
-        overflow-y: auto;
-        padding: 16px;
-    }
-    .cassette-page.light .cassette-sidebar {
-        background: rgba(255,255,255,0.6);
-        border-right: 1px solid #cbd5e1;
-    }
-    .cassette-main {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        position: relative;
-        overflow: hidden;
-    }
-    .cassette-svg-wrap {
-        flex: 1;
-        position: relative;
-        overflow: hidden;
-        padding: 16px;
-    }
-    .cassette-svg-wrap svg {
-        max-width: 100%;
-        max-height: 100%;
-    }
-    .cassette-tooltip {
-        position: absolute;
-        background: rgba(15,23,42,0.95);
-        color: #e2e8f0;
-        border: 1px solid #475569;
-        border-radius: 6px;
-        padding: 8px 12px;
-        font-size: 0.8rem;
-        font-family: monospace;
-        white-space: pre;
-        pointer-events: none;
-        z-index: 200;
-        display: none;
-        opacity: 0;
-        transition: opacity 0.2s;
-        max-width: 320px;
-        line-height: 1.5;
-    }
-    .cassette-toolbar {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 8px 16px;
-        background: rgba(15,23,42,0.4);
-        border-bottom: 1px solid #334155;
-    }
-    .cassette-page.light .cassette-toolbar {
-        background: rgba(255,255,255,0.4);
-        border-bottom: 1px solid #cbd5e1;
-    }
-    .legend-section {
-        margin-bottom: 12px;
-    }
-    .legend-title {
-        font-size: 0.85rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-bottom: 8px;
-        color: #94a3b8;
-    }
-    .legend-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 4px 0;
-    }
+    .legend-row { gap: 4px; }
     .legend-swatch {
-        width: 18px;
-        height: 18px;
-        border-radius: 3px;
-        border: 1px solid #475569;
+        width: 11px; height: 11px; border-radius: 3px;
+        border: 1px solid rgba(148,163,184,0.5);
         flex-shrink: 0;
     }
     .legend-swatch.engine {
@@ -226,164 +67,387 @@ def _css() -> str:
         border-radius: 3px;
         border-style: dashed;
     }
-    .legend-swatch.wingboard {
-        border-radius: 2px;
-        background: rgba(100,116,139,0.3);
-        border: 1px solid #64748b;
+    .cassette-svg-wrap svg {
+        max-width: 100%; max-height: 100%;
     }
-    .dimmed {
-        opacity: 0.12 !important;
-        transition: opacity 0.3s;
+    .module-shape, .module-label, .module-hit,
+    .engine-shape, .engine-hit,
+    .wagon-shape, .wagon-label, .wagon-hit,
+    .board-shape, .board-label, .board-hit {
+        transition: opacity 0.2s ease;
     }
-    .wagon-transparent {
-        opacity: 0.15 !important;
-        transition: opacity 0.3s;
+    .dimmed { opacity: 0.12 !important; }
+    /* Legend overlay: pinned to the top-left corner of the display area,
+       semi-transparent so it doesn't fully obscure the cassette beneath.
+       Sized at 2/3 (~1/1.5) of the original dimensions. */
+    .legend-overlay {
+        position: absolute;
+        top: 5px;
+        left: 5px;
+        z-index: 40;
+        max-width: 160px;
+        max-height: calc(100% - 10px);
+        overflow-y: auto;
+        padding: 7px 8px;
+        border-radius: 5px;
+        border: 1px solid rgba(100, 116, 139, 0.35);
+        background: rgba(241, 245, 249, 0.88);
+        backdrop-filter: blur(4px);
     }
-    .info-table {
-        width: 100%;
-        font-size: 0.8rem;
+    .legend-overlay .q-checkbox__label {
+        font-size: 0.57rem;
     }
-    .info-table td {
-        padding: 4px 8px;
-        border-bottom: 1px solid #334155;
+    .legend-overlay .q-checkbox { min-height: 0; padding: 0; }
+    .legend-overlay .q-checkbox__inner { width: 22px; height: 22px; }
+    .legend-overlay .legend-row { gap: 4px; }
+    /* View-toggle arrow buttons pinned to the top-right of the display. */
+    .view-toggle {
+        position: absolute;
+        top: 5px;
+        right: 5px;
+        z-index: 40;
+        gap: 2px;
     }
-    .cassette-page.light .info-table td {
-        border-bottom: 1px solid #cbd5e1;
+    .view-toggle .q-btn { min-height: 0; padding: 2px 4px; }
+    .view-toggle .q-btn .q-icon { font-size: 18px; }
+    /* Progress-bar overlay shown while a test is running. */
+    .progress-overlay {
+        position: absolute;
+        top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 45;
+        width: 60%;
+        text-align: center;
     }
-    .module-label {
-        fill: #f1f5f9 !important;
+    /* ---- Theme-aware display components ---- */
+    /* Dark mode is the DEFAULT (the app starts in dark mode). Light mode
+       is opt-in via the .cassette-light class on <body>. Train fill colors
+       are NEVER changed -- only strokes, labels, legend and tooltip. */
+    .cassette-svg-wrap .module-shape,
+    .cassette-svg-wrap .engine-shape,
+    .cassette-svg-wrap .wagon-shape,
+    .cassette-svg-wrap .board-shape {
+        stroke: #ffffff;
     }
-    .cassette-page.light .module-label {
-        fill: #1e293b !important;
+    .cassette-svg-wrap .module-label,
+    .cassette-svg-wrap .wagon-label,
+    .cassette-svg-wrap .board-label {
+        fill: #f8fafc !important;
     }
-    .arrow-btn {
-        font-size: 1.2rem;
-        cursor: pointer;
-        padding: 4px 12px;
-        border-radius: 4px;
-        background: #334155;
-        color: #e2e8f0;
-        border: none;
-        transition: background 0.2s;
+    .legend-overlay {
+        border-color: rgba(148, 163, 184, 0.35);
+        background: rgba(15, 23, 42, 0.82);
     }
-    .arrow-btn:hover:not(:disabled) {
-        background: #475569;
+    .legend-overlay .text-gray-400 {
+        color: #94a3b8 !important;
     }
-    .arrow-btn:disabled {
-        opacity: 0.4;
-        cursor: not-allowed;
+    .progress-overlay .text-gray-200 {
+        color: #e2e8f0 !important;
     }
-    .theme-toggle {
-        cursor: pointer;
-        font-size: 1.1rem;
+    #cassette-tooltip {
+        background: rgba(15, 23, 42, 0.95);
+        border-color: rgba(148, 163, 184, 0.4);
+        color: #f1f5f9;
     }
-    </style>
+    #cassette-display-area {
+        background: rgba(255, 255, 255, 0.02);
+    }
+    /* Light mode overrides */
+    .cassette-light .cassette-svg-wrap .module-shape,
+    .cassette-light .cassette-svg-wrap .engine-shape,
+    .cassette-light .cassette-svg-wrap .wagon-shape,
+    .cassette-light .cassette-svg-wrap .board-shape {
+        stroke: #000000;
+    }
+    .cassette-light .cassette-svg-wrap .module-label,
+    .cassette-light .cassette-svg-wrap .wagon-label,
+    .cassette-light .cassette-svg-wrap .board-label {
+        fill: #0f172a !important;
+    }
+    .cassette-light .legend-overlay {
+        border-color: rgba(100, 116, 139, 0.35);
+        background: rgba(241, 245, 249, 0.88);
+    }
+    .cassette-light .legend-overlay .text-gray-400 {
+        color: #475569 !important;
+    }
+    .cassette-light .progress-overlay .text-gray-200 {
+        color: #0f172a !important;
+    }
+    .cassette-light #cassette-tooltip {
+        background: rgba(241, 245, 249, 0.95);
+        border-color: rgba(100, 116, 139, 0.4);
+        color: #0f172a;
+    }
+    .cassette-light #cassette-display-area {
+        background: rgba(0, 0, 0, 0.02);
+    }
+""")
+
+# One set of hover-tooltip helpers shared by every rendered SVG. Positioning
+# is done in screen pixels against the display container's bounding rect so
+# it stays correct no matter how the SVG is scaled to fit its flex-1 box.
+ui.add_head_html(
     """
+    <script>
+    function cassetteHover(evt, text) {
+        const tip = document.getElementById('cassette-tooltip');
+        if (!tip) return;
+        tip.innerText = text;
+        tip.style.display = 'block';
+        cassetteMove(evt);
+    }
+    function cassetteMove(evt) {
+        const tip = document.getElementById('cassette-tooltip');
+        const container = document.getElementById('cassette-display-area');
+        if (!tip || !container) return;
+        const rect = container.getBoundingClientRect();
+        let x = evt.clientX - rect.left + 14;
+        let y = evt.clientY - rect.top + 14;
+        const maxX = Math.max(rect.width - tip.offsetWidth - 8, 0);
+        const maxY = Math.max(rect.height - tip.offsetHeight - 8, 0);
+        x = Math.min(Math.max(x, 0), maxX);
+        y = Math.min(Math.max(y, 0), maxY);
+        tip.style.left = x + 'px';
+        tip.style.top = y + 'px';
+    }
+    function cassetteLeave() {
+        const tip = document.getElementById('cassette-tooltip');
+        if (!tip) return;
+        tip.style.display = 'none';
+    }
+    // Dark mode is the CSS default (no class needed). Light mode is opt-in
+    // via the .cassette-light class on <body>.
+    // Toggle visibility of every SVG element belonging to a train. When a
+    // train is unchecked, its modules/engines/labels are dimmed (not
+    // removed) so the layout stays stable and re-toggling is instant.
+    function setTrainVisible(trainId, visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        const sel = `[data-train="${CSS.escape(trainId)}"]`;
+        svg.querySelectorAll(sel).forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
+    function setWagonsVisible(visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        svg.querySelectorAll('[data-wagon="true"]').forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
+    function setEnginesVisible(visible) {
+        const svg = document.querySelector('.cassette-svg-wrap svg');
+        if (!svg) return;
+        svg.querySelectorAll('.engine-shape, .engine-hit').forEach((el) => {
+            if (visible) el.classList.remove('dimmed');
+            else el.classList.add('dimmed');
+        });
+    }
+    </script>
+    """
+)
+
+dark_mode = ui.dark_mode()
+dark_mode.enable()  # start in dark mode
 
 
-@ui.refreshable
-def cassette_display():
-    model: CassetteModel | None = state["model"]
-    wrap = ui.element("div").classes("cassette-svg-wrap")
-
-    if model is None:
-        with wrap:
-            ui.label("Select a cassette to begin").classes("text-gray-400 text-lg")
-        return
-
-    svg_content = ""
-    if state["view_mode"] == "trains":
-        svg_content = build_svg(model)
+def _on_theme_toggle(e):
+    """Toggle dark mode and the cassette display's colour scheme."""
+    if e.value:
+        dark_mode.enable()
+        ui.run_javascript('document.body.classList.remove("cassette-light");')
     else:
-        svg_content = build_test_svg(model, state["test_results"])
+        dark_mode.disable()
+        ui.run_javascript('document.body.classList.add("cassette-light");')
 
-    # Save to temp file for arrow-button reload
-    fd, tmp_path = tempfile.mkstemp(suffix=".svg", prefix="cassette_")
-    with os.fdopen(fd, "w") as f:
-        f.write(svg_content)
-    if state["view_mode"] == "trains":
-        if state.get("trains_svg_file") and os.path.exists(state["trains_svg_file"]):
-            os.unlink(state["trains_svg_file"])
-        state["trains_svg_file"] = tmp_path
-    else:
-        if state.get("test_svg_file") and os.path.exists(state["test_svg_file"]):
-            os.unlink(state["test_svg_file"])
-        state["test_svg_file"] = tmp_path
+# ============================================================
+# Header: CMS logo + title on the left, menu dropdown on the right
+# ============================================================
+with ui.row().classes("w-full items-center justify-between no-wrap"):
+    with ui.row().classes("items-center gap-4 no-wrap"):
+        # CMS logo first
+        if CMS_LOGO.exists():
+            ui.image(str(CMS_LOGO)).style(
+                "height:56px; width:auto; object-fit:contain;"
+            ).props("alt=CMS logo")
+        # then the title
+        with ui.column().classes("gap-0"):
+            ui.label("High Granularity Calorimeter (CE-H)").style(
+                "font-size:24px;font-weight:bold;"
+            )
+            ui.label("Single Cassette Tester").style(
+                "font-size:24px;font-weight:bold;"
+            )
 
-    with wrap:
-        ui.html(svg_content)
-        ui.element("div").classes("cassette-tooltip").id("cassette-tooltip")
+    with ui.button(icon="menu").props("flat round"):
+        with ui.menu().props('trigger="hover"'):
+            with ui.menu_item(auto_close=False):
+                with ui.row().classes("items-center gap-3 no-wrap"):
+                    ui.label("Theme").classes("text-sm")
+                    ui.switch(
+                        value=True,
+                        on_change=_on_theme_toggle,
+                    ).props(
+                        'checked-icon="dark_mode" unchecked-icon="light_mode" color="blue-grey-7"'
+                    ).tooltip("Toggle light / dark mode")
+
+            ui.menu_item("Test Workflow")
+            ui.menu_item("Documentation")
+            ui.menu_item("Settings")
+
+            ui.separator()
+
+            ui.menu_item("⏻ Shutdown", on_click=lambda: app.shutdown()).classes(
+                "red-background"
+            )
+
+ui.separator()
+
+# state shared between the input handler, the legend, and the test workflow
+state = {
+    "model": None,            # last loaded CassetteModel
+    "visible_trains": {},      # train_id -> bool (trains view)
+    "engines_visible": True,
+    "wagons_visible": True,
+    "test_results": {},        # module.id -> bool (True = pass)
+    "view_mode": "trains",     # "trains" | "test"
+    "test_in_progress": False,
+    "trains_svg_file": None,   # path to temp .svg for the trains view
+    "test_svg_file": None,    # path to temp .svg for the test-results view
+}
+
+with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
+    # ============================================================
+    # LEFT COLUMN - Cassette entry + summary
+    # ============================================================
+    with ui.column().classes("flex-1 gap-3"):
+        ui.markdown("## Cassette Information")
+
+        available = discover_cassettes()
+        placeholder = "e.g. Cassette_7B_33B"
+        if available:
+            placeholder = f"e.g. {available[0]}"
+        cassette_input = ui.input(
+            label="Cassette name:",
+            placeholder=placeholder,
+        ).classes("w-full").tooltip("Enter the .dxf filename without extension")
+
+        summary_table = (
+            ui.table(
+                columns=[
+                    {"name": "field", "label": "Field", "field": "field", "align": "left"},
+                    {"name": "value", "label": "Value", "field": "value", "align": "left"},
+                ],
+                rows=[],
+                row_key="field",
+            )
+            .classes("w-full")
+            .props("flat bordered hide-header")
+        )
+
+    # ============================================================
+    # RIGHT COLUMN - Interactive cassette display with legend overlay
+    # ============================================================
+    with ui.column().classes("flex-1 h-full"):
+        with (
+            ui.column()
+            .classes("w-full h-full border rounded-lg relative overflow-hidden")
+            .props('id="cassette-display-area"')
+            .style("position: relative;")
+        ):
+            svg_slot = ui.element("div").classes(
+                "cassette-svg-wrap w-full h-full flex items-center justify-center"
+            )
+
+            # Legend overlay pinned to the top-left corner of the display area
+            with ui.column().classes("legend-overlay gap-1") as legend_container:
+                ui.label("Load a cassette to see trains.").classes(
+                    "text-sm text-gray-400"
+                )
+
+            # View-toggle arrow buttons pinned to the top-right corner. Hidden
+            # until a test has produced results to toggle between.
+            with ui.row().classes("view-toggle items-center") as toggle_container:
+                toggle_left = ui.button(icon="arrow_back").props(
+                    "flat round dense color=blue-grey-4"
+                ).props("disabled").tooltip("Show trains view")
+                toggle_right = ui.button(icon="arrow_forward").props(
+                    "flat round dense color=blue-grey-4"
+                ).props("disabled").tooltip("Show test-results view")
+
+            # Progress-bar overlay shown while a test is running.
+            with ui.column().classes("progress-overlay") as progress_container:
+                progress_label = ui.label("Running cassette test...").classes(
+                    "text-sm text-gray-200 mb-2"
+                )
+                progress_bar = ui.linear_progress(value=0).props(
+                    "color=green-6 rounded"
+                ).classes("w-full")
+            progress_container.style("display:none;")
+
+            ui.element("div").props('id="cassette-tooltip"').classes(
+                "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
+            ).style(
+                "display:none; position:absolute; z-index:50; pointer-events:none; "
+                "max-width: 260px;"
+            )
 
 
-@ui.refreshable
-def legend_panel():
-    model: CassetteModel | None = state["model"]
-    if model is None:
-        ui.label("No cassette loaded")
-        return
-
-    with ui.column().classes("legend-section w-full"):
-        ui.label("Legend").classes("legend-title")
-
-        # Real trains
-        with ui.column().classes("w-full gap-0"):
-            for train in model.trains:
-                if not train.is_real:
-                    continue
-                visible = state["visible_trains"].get(train.id, True)
-                r, g, b = train.color_rgb
-                swatch = f"rgb({r},{g},{b})"
-                with ui.row().classes("legend-row w-full items-center"):
-                    ui.checkbox(
-                        text=train.label,
-                        value=visible,
-                        on_change=lambda e, tid=train.id: _on_train_toggle(tid, e.value),
-                    ).classes("flex-1")
-                    ui.element("div").classes("legend-swatch").style(f"background:{swatch};")
-
-        # "Train N" groups -> show as engine representations
-        fake_trains = [t for t in model.trains if not t.is_real]
-        if fake_trains:
+def _render_legend(model) -> None:
+    """Build the checkbox legend from the model's trains and engines."""
+    legend_container.clear()
+    with legend_container:
+        ui.label("Trains and Engines").classes(
+            "text-sm text-gray-400"
+        )
+        train_has_elements = {
+            t.id: (
+                any(m.train_id == t.id for m in model.modules)
+                or any(e.train_id == t.id for e in model.engines)
+                or any(w.train_id == t.id for w in model.wagon_links)
+                or any(wb.train_id == t.id for wb in model.wingboards)
+            )
+            for t in model.trains
+        }
+        for t in model.trains:
+            if not train_has_elements.get(t.id, False):
+                continue
+            r, g, b = t.color_rgb
+            swatch = f"rgb({r},{g},{b})"
+            label = t.label
+            if label.startswith("Train "):
+                engine_types = sorted(
+                    {e.engine_type for e in model.engines if e.train_id == t.id and e.engine_type}
+                )
+                label = f"Engine: {', '.join(engine_types)}" if engine_types else "Engine"
+            with ui.row().classes("legend-row w-full items-center"):
+                cb = ui.checkbox(
+                    text=label,
+                    value=True,
+                    on_change=lambda e, tid=t.id: _on_train_toggle(tid, e.value),
+                ).classes("flex-1")
+                cb.tooltip(f"Color: rgb({r}, {g}, {b})  |  Train ID: {t.id}")
+                ui.element("div").classes("legend-swatch").style(
+                    f"background:{swatch};"
+                )
+        if model.engines:
             ui.separator().classes("w-full")
-            ui.label("Engine Collections").classes("legend-title")
-            for train in fake_trains:
-                # Determine if this is HD or LD set
-                density = "HD" if fake_trains.index(train) < len(fake_trains) / 2 else "LD"
-                label = f"{density} Engines"
-                # Find an engine for this train
-                train_engines = [e for e in model.engines if e.train_id == train.id]
-                if train_engines:
-                    e0 = train_engines[0]
-                    r, g, b = e0.color_rgb
-                    swatch = f"rgb({r},{g},{b})"
-                    with ui.row().classes("legend-row w-full items-center"):
-                        ui.checkbox(
-                            text=label,
-                            value=state["engines_visible"],
-                            on_change=lambda e: _on_engines_toggle(e.value),
-                        ).classes("flex-1").tooltip(f"Engine collection: {train.label}")
-                        ui.element("div").classes("legend-swatch engine").style(f"background:{swatch};")
-
-        # Engines toggle (for real trains)
-        if model.engines and any(t.is_real for t in model.trains):
-            ui.separator().classes("w-full")
-            real_engines = [e for e in model.engines if any(t.id == e.train_id and t.is_real for t in model.trains)]
-            if real_engines:
-                e0 = real_engines[0]
+            with ui.row().classes("legend-row w-full items-center"):
+                e0 = model.engines[0]
                 r, g, b = e0.color_rgb
                 swatch = f"rgb({r},{g},{b})"
-                with ui.row().classes("legend-row w-full items-center"):
-                    ui.checkbox(
-                        text="Engines",
-                        value=state["engines_visible"],
-                        on_change=lambda e: _on_engines_toggle(e.value),
-                    ).classes("flex-1")
-                    ui.element("div").classes("legend-swatch engine").style(f"background:{swatch};")
-
-        # Wagons toggle
-        has_wagons = any(m.is_wagon for m in model.modules) or any(
-            hasattr(m, "is_wagon") and m.is_wagon for m in model.modules
-        )
+                ui.checkbox(
+                    text="Engines",
+                    value=True,
+                    on_change=lambda e: _on_engines_toggle(e.value),
+                ).classes("flex-1").tooltip("Red circles on the ENGINES layer")
+                ui.element("div").classes("legend-swatch engine").style(
+                    f"background:{swatch};"
+                )
+        has_wagons = bool(model.wagon_links)
         if has_wagons:
             ui.separator().classes("w-full")
             with ui.row().classes("legend-row w-full items-center"):
@@ -391,49 +455,40 @@ def legend_panel():
                     text="Wagons",
                     value=state["wagons_visible"],
                     on_change=lambda e: _on_wagons_toggle(e.value),
-                ).classes("flex-1").tooltip("Toggle wagon connectors and wagon modules")
+                ).classes("flex-1").tooltip("Dashed wagon connector overlays")
                 ui.element("div").classes("legend-swatch wagon").style(
-                    "background:rgba(148,163,184,0.35);border-style:dashed;"
+                    "background:rgba(148,163,184,0.45);border-style:dashed;"
                 )
 
-        # Wingboards
-        if model.wingboards:
-            ui.separator().classes("w-full")
-            with ui.row().classes("legend-row w-full items-center"):
-                ui.label("Wingboards").classes("flex-1 text-sm")
-                ui.element("div").classes("legend-swatch wingboard")
 
-    # Info table
-    ui.separator().classes("w-full")
-    with ui.column().classes("legend-section w-full"):
-        ui.label("Cassette Info").classes("legend-title")
-        with ui.table(
-            columns=[
-                {"name": "key", "label": "Property", "field": "key", "align": "left"},
-                {"name": "val", "label": "Value", "field": "val", "align": "left"},
-            ],
-            rows=[
-                {"key": "Name", "val": model.name},
-                {"key": "Real trains", "val": str(model.real_train_count)},
-                {"key": "Total modules", "val": str(len(model.modules))},
-                {"key": "Wagon modules", "val": str(sum(1 for m in model.modules if m.is_wagon))},
-                {"key": "Engines", "val": str(len(model.engines))},
-                {"key": "Wingboards", "val": str(len(model.wingboards))},
-            ],
-        ).classes("info-table"):
-            pass
+def _render_test_legend(model, results) -> None:
+    """Build the checkbox legend for the test-results view."""
+    legend_container.clear()
+    with legend_container:
+        ui.label("Tick a status to show it; untick to hide it.").classes(
+            "text-sm text-gray-400"
+        )
+        with ui.row().classes("legend-row w-full items-center"):
+            ui.checkbox(
+                text="Passed",
+                value=True,
+                on_change=lambda e: _on_test_toggle("pass", e.value),
+            ).classes("flex-1").tooltip("Modules that passed the test")
+            ui.element("div").classes("legend-swatch").style("background:#22c55e;")
+        with ui.row().classes("legend-row w-full items-center"):
+            ui.checkbox(
+                text="Failed",
+                value=True,
+                on_change=lambda e: _on_test_toggle("fail", e.value),
+            ).classes("flex-1").tooltip("Modules that failed the test")
+            ui.element("div").classes("legend-swatch").style("background:#ef4444;")
 
 
 def _on_train_toggle(train_id: str, visible: bool) -> None:
     state["visible_trains"][train_id] = visible
-    v = "true" if visible else "false"
-    ui.run_javascript(f'setTrainVisible("{train_id}", {v});')
-
-
-def _on_engines_toggle(visible: bool) -> None:
-    state["engines_visible"] = visible
-    v = "true" if visible else "false"
-    ui.run_javascript(f"setEnginesVisible({v});")
+    ui.run_javascript(
+        f'setTrainVisible({train_id!r}, {"true" if visible else "false"});'
+    )
 
 
 def _on_wagons_toggle(visible: bool) -> None:
@@ -442,90 +497,255 @@ def _on_wagons_toggle(visible: bool) -> None:
     ui.run_javascript(f"setWagonsVisible({v});")
 
 
-def _load_cassette(name: str) -> None:
-    filepath = str(Path(CASSETTE_DIR) / f"{name}.dxf")
-    if not os.path.exists(filepath):
-        ui.notify(f"File not found: {filepath}", type="negative")
+def _on_engines_toggle(visible: bool) -> None:
+    state["engines_visible"] = visible
+    ui.run_javascript(f'setEnginesVisible({"true" if visible else "false"});')
+
+
+def _on_test_toggle(status: str, visible: bool) -> None:
+    ui.run_javascript(
+        f'setTrainVisible({status!r}, {"true" if visible else "false"});'
+    )
+
+
+def _save_svg_temp(svg_content: str, label: str) -> str | None:
+    """Write SVG content to a temp file and return its path."""
+    try:
+        fd, path = tempfile.mkstemp(suffix=f"_{label}.svg", prefix="cassette_")
+        with os.fdopen(fd, "w") as f:
+            f.write(svg_content)
+        return path
+    except OSError:
+        return None
+
+
+def _load_svg_temp(path: str) -> str | None:
+    """Read SVG content back from a temp file."""
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except (OSError, FileNotFoundError):
+        return None
+
+
+def _render_svg_content(svg_content: str) -> None:
+    """Push SVG markup into the svg_slot."""
+    svg_slot.clear()
+    with svg_slot:
+        ui.html(svg_content, sanitize=False).classes("w-full h-full")
+
+
+def _render_view() -> None:
+    """Render the SVG for the current view_mode into svg_slot.
+
+    The generated SVG is also saved to a temp file so the arrow buttons
+    can reload it instantly without regenerating."""
+    model = state["model"]
+    if model is None:
         return
-    model = load_cassette(filepath, name)
+    if state["view_mode"] == "test":
+        svg_content = build_test_svg(model, state["test_results"])
+        _render_test_legend(model, state["test_results"])
+        state["test_svg_file"] = _save_svg_temp(svg_content, "test")
+    else:
+        svg_content = build_svg(model)
+        _render_legend(model)
+        state["trains_svg_file"] = _save_svg_temp(svg_content, "trains")
+    _render_svg_content(svg_content)
+
+
+def _update_toggle_buttons() -> None:
+    has_results = bool(state["test_results"])
+    if not has_results:
+        toggle_left.props("disabled")
+        toggle_right.props("disabled")
+        return
+    if state["view_mode"] == "test":
+        toggle_left.props(remove="disabled")
+        toggle_right.props("disabled")
+    else:  # trains
+        toggle_left.props("disabled")
+        toggle_right.props(remove="disabled")
+
+
+def _on_toggle_left() -> None:
+    if state["view_mode"] != "test":
+        return
+    state["view_mode"] = "trains"
+    # Load the previously-saved trains SVG from its temp file instead of
+    # regenerating it from the model.
+    svg_file = state.get("trains_svg_file")
+    svg_content = _load_svg_temp(svg_file) if svg_file else None
+    if svg_content is not None:
+        _render_svg_content(svg_content)
+        model = state["model"]
+        if model is not None:
+            _render_legend(model)
+    else:
+        _render_view()
+    _update_toggle_buttons()
+
+
+def _on_toggle_right() -> None:
+    if state["view_mode"] != "trains" or not state["test_results"]:
+        return
+    state["view_mode"] = "test"
+    # Load the previously-saved test-results SVG from its temp file instead
+    # of regenerating it from the model.
+    svg_file = state.get("test_svg_file")
+    svg_content = _load_svg_temp(svg_file) if svg_file else None
+    if svg_content is not None:
+        _render_svg_content(svg_content)
+        model = state["model"]
+        if model is not None:
+            _render_test_legend(model, state["test_results"])
+    else:
+        _render_view()
+    _update_toggle_buttons()
+
+
+toggle_left.on_click(_on_toggle_left)
+toggle_right.on_click(_on_toggle_right)
+
+
+async def run_tests() -> None:
+    """Run a (simulated) cassette test and display per-module results.
+
+    Uses the model already loaded by ``load_selected`` -- the run button is
+    kept disabled until that load completes, so ``state["model"]`` is
+    guaranteed to be set when this handler fires.
+    """
+    model = state["model"]
+    if model is None or state["test_in_progress"]:
+        return
+
+    state["test_in_progress"] = True
+
+    # show the progress overlay and reset the bar
+    progress_container.style("display:flex;")
+    progress_container.update()
+    progress_bar.value = 0.0
+    progress_bar.update()
+    progress_label.text = "Running cassette test..."
+    progress_label.update()
+
+    # simulate test work with incremental progress
+    for pct in range(0, 101, 5):
+        progress_bar.value = pct / 100.0
+        progress_bar.update()
+        await asyncio.sleep(0.05)
+
+    progress_label.text = "Test complete!"
+    progress_label.update()
+    await asyncio.sleep(0.2)
+
+    # classify ~5% of modules as failed, rest pass
+    module_ids = [m.id for m in model.modules]
+    fail_count = max(1, round(len(module_ids) * 0.05)) if module_ids else 0
+    failed = set(random.sample(module_ids, fail_count)) if module_ids else set()
+    results = {mid: (mid not in failed) for mid in module_ids}
+    state["test_results"] = results
+
+    # hide the progress overlay
+    progress_container.style("display:none;")
+    progress_container.update()
+
+    # switch to the test-results view
+    state["view_mode"] = "test"
+    _render_view()
+    _update_toggle_buttons()
+
+    state["test_in_progress"] = False
+
+
+# ============================================================
+# Control Buttons -- created AFTER run_tests is defined so we can pass
+# it directly (NiceGUI awaits coroutine-function handlers; a lambda
+# wrapping a coroutine would NOT be awaited and the test would never run).
+# ============================================================
+dynamic_container = ui.row().classes("w-full") 
+
+
+def load_selected(name: str) -> None:
+    svg_slot.clear()
+    dynamic_container.clear()
+    summary_table.rows = []
+    summary_table.update()
+    legend_container.clear()
+    with legend_container:
+        ui.label("Load a cassette to see trains.").classes(
+            "text-sm text-gray-400"
+        )
+
+    # reset test/view state on every (re)load; keep the run button
+    # disabled until a cassette is fully loaded (table + display done)
+    state["model"] = None
+    state["test_results"] = {}
+    state["view_mode"] = "trains"
+    state["test_in_progress"] = False
+    progress_container.style("display:none;")
+    _update_toggle_buttons()
+
+    if not name:
+        return
+
+    filepath = CASSETTE_DIR / f"{name}.dxf"
+    if not filepath.exists():
+        with svg_slot:
+            ui.label(
+                f"No file named '{name}.dxf' in cassette_layouts/."
+            ).classes("text-red-400")
+        if available:
+            with legend_container:
+                ui.label(
+                    f"Available: {', '.join(available)}"
+                ).classes("text-sm text-gray-400")
+        return
+
+    try:
+        model = load_cassette(str(filepath), name)
+    except Exception as ex:
+        with svg_slot:
+            ui.label(f"Failed to load {name}: {ex}").classes("text-red-400")
+        return
+
     state["model"] = model
     state["visible_trains"] = {t.id: True for t in model.trains}
     state["engines_visible"] = True
     state["wagons_visible"] = True
-    state["test_results"] = {}
-    state["view_mode"] = "trains"
-    cassette_display.refresh()
-    legend_panel.refresh()
-    ui.notify(f"Loaded {name}", type="positive")
+
+    summary = summarize(model)
+    summary_table.rows = [
+        {"field": "Cassette", "value": name},
+        {"field": "Cassette Type", "value": summary.cassette_type},
+        {"field": "Full Hex Modules", "value": summary.full_hex},
+        {"field": "Partial Hex Modules", "value": summary.partial_hex},
+        {"field": "Tile Modules", "value": summary.tile},
+        {"field": "Trains", "value": summary.trains},
+        {"field": "Engines", "value": summary.engines},
+        {"field": "Wingboards", "value": summary.wingboards},
+        {"field": "Motherboards", "value": summary.motherboards},
+    ]
+    summary_table.update()
+
+    _render_view()
+    _update_toggle_buttons()
+
+    # cassette is fully loaded (table + display populated) -- enable the
+    # run button so a test can be executed for this cassette.
+    with dynamic_container:
+        with ui.row().classes("w-1/4 gap-2"):
+            run_button = ui.button(
+                "▶ Run Cassette Test",
+                on_click=run_tests,
+            ).classes("green-background flex-1")
 
 
-def _run_test() -> None:
-    model = state["model"]
-    if model is None:
-        return
-    state["test_in_progress"] = True
-    import random
-    results = {}
-    for m in model.modules:
-        results[m.id] = random.random() > 0.15
-    state["test_results"] = results
-    state["view_mode"] = "test"
-    state["test_in_progress"] = False
-    cassette_display.refresh()
-    passed = sum(1 for v in results.values() if v)
-    total = len(results)
-    ui.notify(f"Test complete: {passed}/{total} passed", type="positive")
+# Register the input callback last, after run_button and all handler
+# functions exist, so load_selected can safely access run_button even if
+# on_value_change fires during page setup.
+cassette_input.on_value_change(lambda e: load_selected(e.value))
 
-
-def _show_trains_view() -> None:
-    state["view_mode"] = "trains"
-    cassette_display.refresh()
-
-
-def _show_test_view() -> None:
-    state["view_mode"] = "test"
-    cassette_display.refresh()
-
-
-@ui.page("/")
-def main_page():
-    ui.add_head_html(_css())
-    ui.add_head_html(f"<script>{_hover_js()}</script>")
-
-    dark = {"dark": True}
-
-    with ui.column().classes("cassette-page w-full h-full") as page:
-        # Header
-        with ui.row().classes("cassette-header w-full"):
-            ui.label("Cassette Viewer").classes("cassette-title")
-            with ui.row().classes("items-center gap-4"):
-                files = _get_cassette_files()
-                ui.select(
-                    options=files,
-                    label="Cassette",
-                    on_change=lambda e: _load_cassette(e.value),
-                ).classes("w-64")
-                ui.button("Run Test", on_click=_run_test, color="primary").props("icon=science")
-                ui.button("Trains", on_click=_show_trains_view, color="secondary").props("icon=list")
-                ui.button("Test Results", on_click=_show_test_view, color="secondary").props("icon=assessment")
-                # Theme toggle
-                def toggle_theme():
-                    dark["dark"] = not dark["dark"]
-                    if dark["dark"]:
-                        page.classes(remove="light")
-                    else:
-                        page.classes(add="light")
-                ui.button(icon="dark_mode", on_click=toggle_theme).classes("theme-toggle")
-
-        # Body
-        with ui.row().classes("cassette-body w-full"):
-            # Sidebar
-            with ui.column().classes("cassette-sidebar"):
-                legend_panel()
-
-            # Main
-            with ui.column().classes("cassette-main"):
-                cassette_display()
-
-
-ui.run(port=8080, title="Cassette Viewer", dark=True, reload=False)
+ui.run(
+    title="[HGCAL] Single Cassette Tester",
+)
