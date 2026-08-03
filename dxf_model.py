@@ -61,6 +61,19 @@ class Engine:
     color_rgb: tuple[int, int, int]
     engine_type: str = ""
     motherboard: str = ""
+    density: str = ""  # "HD" | "LD" | ""
+
+
+@dataclass
+class WagonLink:
+    id: str
+    train_id: str
+    polygon: list[tuple[float, float]]
+    label_point: tuple[float, float]
+    module_code: str
+    uv: tuple[int, int] | None
+    name: str
+    color_rgb: tuple[int, int, int]
 
 
 @dataclass
@@ -69,7 +82,20 @@ class Wingboard:
     train_id: str
     polygon: list[tuple[float, float]]
     centroid: tuple[float, float]
-    wingboard_name: str = ""
+    name: str = ""
+    module_code: str = ""
+
+
+@dataclass
+class Summary:
+    cassette_type: str = ""
+    full_hex: int = 0
+    partial_hex: int = 0
+    tile: int = 0
+    trains: int = 0
+    engines: int = 0
+    wingboards: int = 0
+    motherboards: int = 0
 
 
 @dataclass
@@ -88,6 +114,7 @@ class CassetteModel:
     modules: list[Module] = field(default_factory=list)
     engines: list[Engine] = field(default_factory=list)
     wingboards: list[Wingboard] = field(default_factory=list)
+    wagon_links: list[WagonLink] = field(default_factory=list)
     trains: list[Train] = field(default_factory=list)
     bounds: tuple[float, float, float, float] = (0, 0, 1, 1)
     real_train_count: int = 0
@@ -312,6 +339,9 @@ def load_cassette(filepath: str, name: str) -> CassetteModel:
     # --- Build wingboards ---
     _build_wingboards(model)
 
+    # --- Build wagon links ---
+    _build_wagon_links(model)
+
     return model
 
 
@@ -392,22 +422,22 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
                     best.engine_type = eng_type
                     best.train_id = train_id
                     best.motherboard = motherboard
+                    best.density = _train_density(train_label)
 
 
 def _build_wingboards(model: CassetteModel) -> None:
     """Build wingboard rectangles at the boundary of E and G type tile modules.
 
     Wingboards are longer rectangular blocks placed at the outer edge of
-    E-type and G-type modules (the first and last modules in TL/TH trains).
-    Width is slightly smaller than the engine circle diameter.
+    E-type and G-type modules. Width is smaller than the engine circle
+    diameter so they don't touch the train boundary.
     """
     if not model.engines:
         return
 
-    # Engine radius for sizing
     avg_radius = sum(e.radius for e in model.engines) / max(len(model.engines), 1)
-    wb_width = avg_radius * 2 * 0.8  # slightly smaller than engine circle diameter
-    wb_length = avg_radius * 3.0     # longer rectangular block
+    wb_width = avg_radius * 2 * 0.55  # smaller than engine circle, doesn't touch boundary
+    wb_length = avg_radius * 3.0
 
     for train in model.trains:
         if not train.is_real:
@@ -429,8 +459,9 @@ def _build_wingboards(model: CassetteModel) -> None:
             dist = math.sqrt(dx * dx + dy * dy)
             if dist < 1e-6:
                 continue
-            # Offset position: move outward from train center past the module edge
-            offset = 50.0  # offset beyond module boundary
+            # Offset position: move outward from train center, inset so the
+            # wingboard stays within the train boundary.
+            offset = 35.0
             wb_cx = cx + (dx / dist) * offset
             wb_cy = cy + (dy / dist) * offset
             # Build rectangle perpendicular to the outward direction
@@ -449,5 +480,126 @@ def _build_wingboards(model: CassetteModel) -> None:
                 train_id=train.id,
                 polygon=[p1, p2, p3, p4],
                 centroid=(wb_cx, wb_cy),
-                wingboard_name=mod.wingboard,
+                name=mod.wingboard,
+                module_code=mod.code,
             ))
+
+
+def _build_wagon_links(model: CassetteModel) -> None:
+    """Build wagon connector rectangles between adjacent modules in each train.
+
+    Uses a generalized proximity-based adjacency approach:
+      1. For each real train, compute all pairwise centroid distances between
+         its modules.
+      2. Build a minimum spanning tree (MST) via Prim's algorithm — this
+         guarantees every module is connected to the network with the shortest
+         total link length, naturally handling:
+           - Linear chains (W1-W2-W3, E1-E2-E3-E4)
+           - Branched layouts (E3 adjacent to E1, W1 adjacent to W3)
+           - Partial hexagons (included just like full ones)
+           - Cross-connections (W1 to E1 across the engine)
+      3. No links are created between modules of different trains (each
+         train's MST is computed independently).
+
+    Each link becomes a small rectangular polygon (dotted border in SVG).
+    """
+    link_counter = 0
+    for train in model.trains:
+        if not train.is_real:
+            continue
+        train_mods = [m for m in model.modules if m.train_id == train.id]
+        n = len(train_mods)
+        if n < 2:
+            continue
+
+        # Compute pairwise distances
+        dist_matrix = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = train_mods[i].centroid[0] - train_mods[j].centroid[0]
+                dy = train_mods[i].centroid[1] - train_mods[j].centroid[1]
+                d = math.sqrt(dx * dx + dy * dy)
+                dist_matrix[i][j] = d
+                dist_matrix[j][i] = d
+
+        # Prim's MST
+        in_tree = [False] * n
+        in_tree[0] = True
+        edges: list[tuple[int, int]] = []
+        for _ in range(n - 1):
+            best_dist = float("inf")
+            best_i, best_j = -1, -1
+            for i in range(n):
+                if not in_tree[i]:
+                    continue
+                for j in range(n):
+                    if in_tree[j]:
+                        continue
+                    if dist_matrix[i][j] < best_dist:
+                        best_dist = dist_matrix[i][j]
+                        best_i, best_j = i, j
+            if best_j == -1:
+                break
+            in_tree[best_j] = True
+            edges.append((best_i, best_j))
+
+        # Create wagon link rectangles
+        for i, j in edges:
+            mod_a = train_mods[i]
+            mod_b = train_mods[j]
+            link_counter += 1
+            polygon = _wagon_rect(mod_a, mod_b)
+            model.wagon_links.append(WagonLink(
+                id=f"wlink-{link_counter}",
+                train_id=train.id,
+                polygon=polygon,
+                label_point=(
+                    (mod_a.centroid[0] + mod_b.centroid[0]) / 2,
+                    (mod_a.centroid[1] + mod_b.centroid[1]) / 2,
+                ),
+                module_code=f"{mod_a.code}-{mod_b.code}",
+                uv=mod_a.uv,
+                name=mod_a.wagon_name or mod_b.wagon_name,
+                color_rgb=train.color_rgb,
+            ))
+
+
+def _wagon_rect(mod_a: Module, mod_b: Module) -> list[tuple[float, float]]:
+    """Compute a narrow rectangle between two module centroids."""
+    x1, y1 = mod_a.centroid
+    x2, y2 = mod_b.centroid
+    dx = x2 - x1
+    dy = y2 - y1
+    length = math.sqrt(dx * dx + dy * dy)
+    if length < 1e-6:
+        return []
+    ux, uy = dx / length, dy / length
+    perp_x, perp_y = -uy, ux
+    half_w = 12.0
+    shrink = 30.0
+    sx, sy = x1 + ux * shrink, y1 + uy * shrink
+    ex, ey = x2 - ux * shrink, y2 - uy * shrink
+    return [
+        (sx + perp_x * half_w, sy + perp_y * half_w),
+        (sx - perp_x * half_w, sy - perp_y * half_w),
+        (ex - perp_x * half_w, ey - perp_y * half_w),
+        (ex + perp_x * half_w, ey + perp_y * half_w),
+    ]
+
+
+def summarize(model: CassetteModel) -> Summary:
+    """Produce a summary of the cassette model for the info table."""
+    full_hex = sum(1 for m in model.modules if m.shape == "hex_full")
+    partial_hex = sum(1 for m in model.modules if m.shape == "hex_partial")
+    tile = sum(1 for m in model.modules if m.shape == "tile")
+    motherboards = sum(1 for e in model.engines if e.motherboard)
+    return Summary(
+        cassette_type=model.name,
+        full_hex=full_hex,
+        partial_hex=partial_hex,
+        tile=tile,
+        trains=model.real_train_count,
+        engines=len(model.engines),
+        wingboards=len(model.wingboards),
+        motherboards=motherboards,
+    )

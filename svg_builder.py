@@ -195,14 +195,8 @@ def build_svg(model: CassetteModel) -> str:
         parts.append(
             f'<polygon points="{points}" fill="#38bdf8" fill-opacity="0.42" '
             f'stroke="#e0f2fe" stroke-width="{stroke_width:.3f}" '
+            f'stroke-dasharray="{stroke_width * 2:.2f} {stroke_width * 1.5:.2f}" '
             f'class="board-shape wingboard-shape" data-train="{data_train}"></polygon>'
-        )
-        sx, sy = tx(wb.centroid[0]), ty(wb.centroid[1])
-        parts.append(
-            f'<text x="{sx:.2f}" y="{sy:.2f}" text-anchor="middle" dominant-baseline="central" '
-            f'font-size="{font_size * 0.72:.2f}" font-family="monospace" font-weight="600" '
-            f'pointer-events="none" class="board-label" data-train="{data_train}">'
-            f'{html.escape(wb.name)}</text>'
         )
         parts.append(
             f'<polygon points="{points}" fill="transparent" stroke="none" '
@@ -225,20 +219,6 @@ def build_svg(model: CassetteModel) -> str:
             f'stroke-dasharray="{stroke_width * 2.2:.2f} {stroke_width * 1.7:.2f}" '
             f'class="wagon-shape" data-train="{data_train}" data-wagon="true"></polygon>'
         )
-        sx, sy = tx(wlink.label_point[0]), ty(wlink.label_point[1])
-        label_lines = [wlink.module_code]
-        if wlink.uv is not None:
-            label_lines.append(f"({wlink.uv[0]},{wlink.uv[1]})")
-        parts.append(
-            f'<text x="{sx:.2f}" y="{sy:.2f}" text-anchor="middle" dominant-baseline="central" '
-            f'font-size="{font_size * 0.66:.2f}" font-family="monospace" font-weight="600" '
-            f'pointer-events="none" class="wagon-label" data-train="{data_train}" data-wagon="true">'
-            + "".join(
-                f'<tspan x="{sx:.2f}" dy="{i * 1.05:.2f}em">{html.escape(ln)}</tspan>'
-                for i, ln in enumerate(label_lines)
-            )
-            + "</text>"
-        )
         parts.append(
             f'<polygon points="{points}" fill="transparent" stroke="none" '
             f'class="wagon-hit" style="cursor:pointer;" data-train="{data_train}" data-wagon="true" '
@@ -257,15 +237,17 @@ def build_svg(model: CassetteModel) -> str:
         tooltip_json = json.dumps(_engine_tooltip(e, train_label))
         tooltip_text = html.escape(tooltip_json, quote=True)
         data_train = html.escape(e.train_id, quote=True)
+        density_attr = f' data-engine-density="{html.escape(e.density)}"' if e.density else ''
+        mb_attr = ' data-motherboard="true"' if e.motherboard else ''
         parts.append(
             f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="{radius:.2f}" fill="{fill}" '
             f'fill-opacity="0.95" stroke="#e2e8f0" stroke-width="{stroke_width:.3f}" '
-            f'class="engine-shape" data-train="{data_train}"></circle>'
+            f'class="engine-shape" data-train="{data_train}"{density_attr}{mb_attr}></circle>'
         )
         parts.append(
             f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="{radius:.2f}" fill="transparent" '
             f'stroke="none" class="engine-hit" style="cursor:pointer;" '
-            f'data-train="{data_train}" '
+            f'data-train="{data_train}"{density_attr}{mb_attr} '
             f'onmouseenter="cassetteHover(event, {tooltip_text})" '
             f'onmousemove="cassetteMove(event)" '
             f'onmouseleave="cassetteLeave(event)"></circle>'
