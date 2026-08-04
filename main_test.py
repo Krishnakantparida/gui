@@ -646,8 +646,8 @@ def _render_legend(model) -> None:
 
 def _render_test_legend(model, results) -> None:
     """Build the checkbox legend for the test-results view."""
-    legend_container.clear()
-    with legend_container:
+    test_legend_container.clear()
+    with test_legend_container:
         ui.label("Tick a status to show it; untick to hide it.").classes(
             "text-sm text-gray-400"
         )
