@@ -22,7 +22,7 @@ from pathlib import Path
 import asyncio
 from nicegui import ui, app
 
-from dxf_model import load_cassette, summarize
+from dxf_model import load_cassette, summarize, save_dxf
 from svg_builder import build_svg, build_test_svg
 
 CASSETTE_DIR = Path(__file__).parent / "cassette_layouts"
@@ -113,11 +113,22 @@ ui.add_css("""
     /* Progress-bar overlay shown while a test is running. */
     .progress-overlay {
         position: absolute;
-        top: 50%; left: 50%;
-        transform: translate(-50%, -50%);
-        z-index: 45;
-        width: 60%;
-        text-align: center;
+        bottom: 8px; left: 8px; right: 8px;
+        z-index: 30;
+        padding: 10px 14px;
+        border-radius: 8px;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        background: rgba(15, 23, 42, 0.92);
+    }
+    .test-display-buttons {
+        position: absolute;
+        top: 8px; right: 8px;
+        z-index: 20;
+        gap: 2px;
+        padding: 2px 4px;
+        border-radius: 8px;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        background: rgba(15, 23, 42, 0.82);
     }
     /* ---- Theme-aware display components ---- */
     /* Dark mode is the DEFAULT (the app starts in dark mode). Light mode
@@ -221,8 +232,8 @@ ui.add_head_html(
     // Toggle visibility of every SVG element belonging to a train. When a
     // train is unchecked, its modules/engines/labels are dimmed (not
     // removed) so the layout stays stable and re-toggling is instant.
-    function setTrainVisible(trainId, visible) {
-        const svg = document.querySelector('.cassette-svg-wrap svg');
+    function setTrainVisible(trainId, visible, wrapSelector) {
+        const svg = document.querySelector((wrapSelector || '.cassette-svg-wrap') + ' svg');
         if (!svg) return;
         const sel = `[data-train="${CSS.escape(trainId)}"]`;
         svg.querySelectorAll(sel).forEach((el) => {
@@ -230,48 +241,48 @@ ui.add_head_html(
             else el.classList.add('dimmed');
         });
     }
-    function setWagonsVisible(visible) {
-        const svg = document.querySelector('.cassette-svg-wrap svg');
+    function setWagonsVisible(visible, wrapSelector) {
+        const svg = document.querySelector((wrapSelector || '.cassette-svg-wrap') + ' svg');
         if (!svg) return;
         svg.querySelectorAll('[data-wagon="true"]').forEach((el) => {
             if (visible) el.classList.remove('dimmed');
             else el.classList.add('dimmed');
         });
     }
-    function setEnginesVisible(visible) {
-        const svg = document.querySelector('.cassette-svg-wrap svg');
+    function setEnginesVisible(visible, wrapSelector) {
+        const svg = document.querySelector((wrapSelector || '.cassette-svg-wrap') + ' svg');
         if (!svg) return;
         svg.querySelectorAll('.engine-shape, .engine-hit').forEach((el) => {
             if (visible) el.classList.remove('dimmed');
             else el.classList.add('dimmed');
         });
     }
-    function setBoardsVisible(visible) {
-        const svg = document.querySelector('.cassette-svg-wrap svg');
+    function setBoardsVisible(visible, wrapSelector) {
+        const svg = document.querySelector((wrapSelector || '.cassette-svg-wrap') + ' svg');
         if (!svg) return;
         svg.querySelectorAll('.board-shape, .board-hit').forEach((el) => {
             if (visible) el.classList.remove('dimmed');
             else el.classList.add('dimmed');
         });
     }
-    function setHDEnginesVisible(visible) {
-        const svg = document.querySelector('.cassette-svg-wrap svg');
+    function setHDEnginesVisible(visible, wrapSelector) {
+        const svg = document.querySelector((wrapSelector || '.cassette-svg-wrap') + ' svg');
         if (!svg) return;
         svg.querySelectorAll('[data-engine-density="HD"]').forEach((el) => {
             if (visible) el.classList.remove('dimmed');
             else el.classList.add('dimmed');
         });
     }
-    function setLDEnginesVisible(visible) {
-        const svg = document.querySelector('.cassette-svg-wrap svg');
+    function setLDEnginesVisible(visible, wrapSelector) {
+        const svg = document.querySelector((wrapSelector || '.cassette-svg-wrap') + ' svg');
         if (!svg) return;
         svg.querySelectorAll('[data-engine-density="LD"]').forEach((el) => {
             if (visible) el.classList.remove('dimmed');
             else el.classList.add('dimmed');
         });
     }
-    function setMotherboardsVisible(visible) {
-        const svg = document.querySelector('.cassette-svg-wrap svg');
+    function setMotherboardsVisible(visible, wrapSelector) {
+        const svg = document.querySelector((wrapSelector || '.cassette-svg-wrap') + ' svg');
         if (!svg) return;
         svg.querySelectorAll('[data-motherboard="true"]').forEach((el) => {
             if (visible) el.classList.remove('dimmed');
@@ -357,6 +368,7 @@ state = {
     "test_svg_index": -1,     # current index in test_svg_history
     "test_toggle_left": None,  # ui.Button for test-history nav (created dynamically)
     "test_toggle_right": None,
+    "save_button": None,       # ui.Button for DXF export (created dynamically)
 }
 
 with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
@@ -389,27 +401,124 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
         )
 
     # ============================================================
-    # RIGHT COLUMN - Interactive cassette display with legend overlay
+    # ---- Functions needed by the UI layout below (defined early) ----
+    def _update_toggle_buttons() -> None:
+        tl = state.get("test_toggle_left")
+        tr = state.get("test_toggle_right")
+        if tl is None or tr is None:
+            return
+        history = state.get("test_svg_history", [])
+        idx = state.get("test_svg_index", -1)
+        if not history or idx < 0:
+            tl.props("disabled")
+            tr.props("disabled")
+            return
+        if idx > 0:
+            tl.props(remove="disabled")
+        else:
+            tl.props("disabled")
+        if idx < len(history) - 1:
+            tr.props(remove="disabled")
+        else:
+            tr.props("disabled")
+
+    def _on_test_toggle_left() -> None:
+        history = state.get("test_svg_history", [])
+        idx = state.get("test_svg_index", -1)
+        if idx > 0:
+            state["test_svg_index"] = idx - 1
+            svg_content = _load_svg_temp(history[idx - 1])
+            if svg_content is not None:
+                _render_svg_content(svg_content, test_svg_slot)
+                model = state["model"]
+                if model is not None:
+                    _render_test_legend(model, state["test_results"])
+        _update_toggle_buttons()
+
+    def _on_test_toggle_right() -> None:
+        history = state.get("test_svg_history", [])
+        idx = state.get("test_svg_index", -1)
+        if idx < len(history) - 1:
+            state["test_svg_index"] = idx + 1
+            svg_content = _load_svg_temp(history[idx + 1])
+            if svg_content is not None:
+                _render_svg_content(svg_content, test_svg_slot)
+                model = state["model"]
+                if model is not None:
+                    _render_test_legend(model, state["test_results"])
+        _update_toggle_buttons()
+
+    def _update_save_button() -> None:
+        sb = state.get("save_button")
+        if sb is None:
+            return
+        if state.get("test_results"):
+            sb.props(remove="disabled")
+        else:
+            sb.props("disabled")
+
+    def _on_save_dxf() -> None:
+        model = state["model"]
+        if model is None:
+            return
+        import tempfile, os
+        fd, tmp_path = tempfile.mkstemp(suffix=".dxf", prefix="cassette_")
+        os.close(fd)
+        save_dxf(model, tmp_path)
+        ui.download(tmp_path)
+
+    # RIGHT COLUMN - Two stacked interactive cassette displays
     # ============================================================
-    with ui.column().classes("flex-1 h-full"):
+    with ui.column().classes("flex-1 h-full gap-2"):
+        # --- Top: Trains display ---
         with (
             ui.column()
-            .classes("w-full h-full border rounded-lg relative overflow-hidden")
+            .classes("w-full flex-1 border rounded-lg relative overflow-hidden")
             .props('id="cassette-display-area"')
-            .style("position: relative;")
+            .style("position: relative; min-height: 0;")
         ):
-            svg_slot = ui.element("div").classes(
-                "cassette-svg-wrap w-full h-full flex items-center justify-center"
+            trains_svg_slot = ui.element("div").classes(
+                "cassette-svg-wrap trains-svg-wrap w-full h-full flex items-center justify-center"
             )
-
-            # Legend overlay pinned to the top-left corner of the display area
             with ui.column().classes("legend-overlay gap-1") as legend_container:
                 ui.label("Load a cassette to see trains.").classes(
                     "text-sm text-gray-400"
                 )
+            ui.element("div").props('id="cassette-tooltip"').classes(
+                "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
+            ).style(
+                "display:none; position:absolute; z-index:50; pointer-events:none; "
+                "max-width: 260px;"
+            )
 
-            # View-toggle arrow buttons removed from cassette display --
-            # they now live in the test display beside the Run button.
+        # --- Bottom: Test-results display ---
+        with (
+            ui.column()
+            .classes("w-full flex-1 border rounded-lg relative overflow-hidden")
+            .props('id="test-display-area"')
+            .style("position: relative; min-height: 0;")
+        ):
+            test_svg_slot = ui.element("div").classes(
+                "cassette-svg-wrap test-svg-wrap w-full h-full flex items-center justify-center"
+            )
+            with ui.column().classes("legend-overlay gap-1") as test_legend_container:
+                ui.label("Run a test to see results.").classes(
+                    "text-sm text-gray-400"
+                )
+            # Arrow + save buttons pinned to top-right of test display
+            with ui.row().classes("test-display-buttons") as test_buttons_row:
+                state["test_toggle_left"] = ui.button(icon="arrow_back").props(
+                    "flat round dense color=blue-grey-4"
+                ).props("disabled").tooltip("Previous test result")
+                state["test_toggle_right"] = ui.button(icon="arrow_forward").props(
+                    "flat round dense color=blue-grey-4"
+                ).props("disabled").tooltip("Next test result")
+                state["save_button"] = ui.button(icon="save").props(
+                    "flat round dense color=blue-grey-4"
+                ).props("disabled").tooltip("Save tested cassette as .dxf")
+                state["test_toggle_left"].on_click(_on_test_toggle_left)
+                state["test_toggle_right"].on_click(_on_test_toggle_right)
+                state["save_button"].on_click(_on_save_dxf)
 
             # Progress-bar overlay shown while a test is running.
             with ui.column().classes("progress-overlay") as progress_container:
@@ -420,13 +529,6 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
                     "color=green-6 rounded"
                 ).classes("w-full")
             progress_container.style("display:none;")
-
-            ui.element("div").props('id="cassette-tooltip"').classes(
-                "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
-            ).style(
-                "display:none; position:absolute; z-index:50; pointer-events:none; "
-                "max-width: 260px;"
-            )
 
 
 def _render_legend(model) -> None:
@@ -568,48 +670,48 @@ def _render_test_legend(model, results) -> None:
 def _on_train_toggle(train_id: str, visible: bool) -> None:
     state["visible_trains"][train_id] = visible
     ui.run_javascript(
-        f'setTrainVisible({train_id!r}, {"true" if visible else "false"});'
+        f'setTrainVisible({train_id!r}, {"true" if visible else "false"}, \'.trains-svg-wrap\');'
     )
 
 
 def _on_wagons_toggle(visible: bool) -> None:
     state["wagons_visible"] = visible
     v = "true" if visible else "false"
-    ui.run_javascript(f"setWagonsVisible({v});")
+    ui.run_javascript(f"setWagonsVisible({v}, '.trains-svg-wrap');")
 
 
 def _on_wingboards_toggle(visible: bool) -> None:
     state["wingboards_visible"] = visible
     v = "true" if visible else "false"
-    ui.run_javascript(f"setBoardsVisible({v});")
+    ui.run_javascript(f"setBoardsVisible({v}, '.trains-svg-wrap');")
 
 
 def _on_motherboards_toggle(visible: bool) -> None:
     state["motherboards_visible"] = visible
     v = "true" if visible else "false"
-    ui.run_javascript(f"setMotherboardsVisible({v});")
+    ui.run_javascript(f"setMotherboardsVisible({v}, '.trains-svg-wrap');")
 
 
 def _on_hd_engines_toggle(visible: bool) -> None:
     state["hd_engines_visible"] = visible
     v = "true" if visible else "false"
-    ui.run_javascript(f"setHDEnginesVisible({v});")
+    ui.run_javascript(f"setHDEnginesVisible({v}, '.trains-svg-wrap');")
 
 
 def _on_ld_engines_toggle(visible: bool) -> None:
     state["ld_engines_visible"] = visible
     v = "true" if visible else "false"
-    ui.run_javascript(f"setLDEnginesVisible({v});")
+    ui.run_javascript(f"setLDEnginesVisible({v}, '.trains-svg-wrap');")
 
 
 def _on_engines_toggle(visible: bool) -> None:
     state["engines_visible"] = visible
-    ui.run_javascript(f'setEnginesVisible({"true" if visible else "false"});')
+    ui.run_javascript(f'setEnginesVisible({"true" if visible else "false"}, \'.trains-svg-wrap\');')
 
 
 def _on_test_toggle(status: str, visible: bool) -> None:
     ui.run_javascript(
-        f'setTrainVisible({status!r}, {"true" if visible else "false"});'
+        f'setTrainVisible({status!r}, {"true" if visible else "false"}, \'.test-svg-wrap\');'
     )
 
 
@@ -633,82 +735,74 @@ def _load_svg_temp(path: str) -> str | None:
         return None
 
 
-def _render_svg_content(svg_content: str) -> None:
-    """Push SVG markup into the svg_slot."""
-    svg_slot.clear()
-    with svg_slot:
+def _render_svg_content(svg_content: str, slot=None) -> None:
+    """Push SVG markup into a svg slot (default: trains)."""
+    if slot is None:
+        slot = trains_svg_slot
+    slot.clear()
+    with slot:
         ui.html(svg_content, sanitize=False).classes("w-full h-full")
 
 
 def _render_view() -> None:
-    """Render the SVG for the current view_mode into svg_slot.
+    """Render SVGs for both display sections.
 
-    The generated SVG is also saved to a temp file so the arrow buttons
-    can reload it instantly without regenerating."""
+    The trains display always shows the cassette layout. The test display
+    shows test results if available, or a placeholder otherwise.
+    """
     model = state["model"]
     if model is None:
         return
-    if state["view_mode"] == "test":
-        svg_content = build_test_svg(model, state["test_results"])
+
+    # Always render the trains view in the top display
+    svg_content = build_svg(model)
+    _render_legend(model)
+    state["trains_svg_file"] = _save_svg_temp(svg_content, "trains")
+    _render_svg_content(svg_content, trains_svg_slot)
+
+    # Apply visibility state via JS (fixes wagons-showing-on-load bug)
+    ui.run_javascript(
+        f'setWagonsVisible({"true" if state["wagons_visible"] else "false"}, '
+        f"'.trains-svg-wrap');"
+    )
+    ui.run_javascript(
+        f'setEnginesVisible({"true" if state["engines_visible"] else "false"}, '
+        f"'.trains-svg-wrap');"
+    )
+    ui.run_javascript(
+        f'setBoardsVisible({"true" if state["wingboards_visible"] else "false"}, '
+        f"'.trains-svg-wrap');"
+    )
+    ui.run_javascript(
+        f'setMotherboardsVisible({"true" if state["motherboards_visible"] else "false"}, '
+        f"'.trains-svg-wrap');"
+    )
+    ui.run_javascript(
+        f'setHDEnginesVisible({"true" if state["hd_engines_visible"] else "false"}, '
+        f"'.trains-svg-wrap');"
+    )
+    ui.run_javascript(
+        f'setLDEnginesVisible({"true" if state["ld_engines_visible"] else "false"}, '
+        f"'.trains-svg-wrap');"
+    )
+    for tid, vis in state["visible_trains"].items():
+        ui.run_javascript(
+            f'setTrainVisible({tid!r}, {"true" if vis else "false"}, '
+            f"'.trains-svg-wrap');"
+        )
+
+    # Render the test display if results exist
+    if state["test_results"]:
+        test_svg = build_test_svg(model, state["test_results"])
         _render_test_legend(model, state["test_results"])
-        state["test_svg_file"] = _save_svg_temp(svg_content, "test")
+        state["test_svg_file"] = _save_svg_temp(test_svg, "test")
+        _render_svg_content(test_svg, test_svg_slot)
     else:
-        svg_content = build_svg(model)
-        _render_legend(model)
-        state["trains_svg_file"] = _save_svg_temp(svg_content, "trains")
-    _render_svg_content(svg_content)
-
-
-def _update_toggle_buttons() -> None:
-    """Update the test-history arrow buttons based on test_svg_history."""
-    tl = state.get("test_toggle_left")
-    tr = state.get("test_toggle_right")
-    if tl is None or tr is None:
-        return
-    history = state.get("test_svg_history", [])
-    idx = state.get("test_svg_index", -1)
-    if not history or idx < 0:
-        tl.props("disabled")
-        tr.props("disabled")
-        return
-    if idx > 0:
-        tl.props(remove="disabled")
-    else:
-        tl.props("disabled")
-    if idx < len(history) - 1:
-        tr.props(remove="disabled")
-    else:
-        tr.props("disabled")
-
-
-def _on_test_toggle_left() -> None:
-    """Navigate backward through test SVG history."""
-    history = state.get("test_svg_history", [])
-    idx = state.get("test_svg_index", -1)
-    if idx > 0:
-        state["test_svg_index"] = idx - 1
-        svg_content = _load_svg_temp(history[idx - 1])
-        if svg_content is not None:
-            _render_svg_content(svg_content)
-            model = state["model"]
-            if model is not None:
-                _render_test_legend(model, state["test_results"])
-    _update_toggle_buttons()
-
-
-def _on_test_toggle_right() -> None:
-    """Navigate forward through test SVG history."""
-    history = state.get("test_svg_history", [])
-    idx = state.get("test_svg_index", -1)
-    if idx < len(history) - 1:
-        state["test_svg_index"] = idx + 1
-        svg_content = _load_svg_temp(history[idx + 1])
-        if svg_content is not None:
-            _render_svg_content(svg_content)
-            model = state["model"]
-            if model is not None:
-                _render_test_legend(model, state["test_results"])
-    _update_toggle_buttons()
+        test_svg_slot.clear()
+        with test_svg_slot:
+            ui.label("Run a test to see results.").classes(
+                "text-sm text-gray-400"
+            )
 
 
 async def run_tests() -> None:
@@ -763,6 +857,7 @@ async def run_tests() -> None:
         state["test_svg_history"].append(svg_file)
         state["test_svg_index"] = len(state["test_svg_history"]) - 1
     _update_toggle_buttons()
+    _update_save_button()
 
     state["test_in_progress"] = False
 
@@ -776,7 +871,9 @@ dynamic_container = ui.row().classes("w-full")
 
 
 def load_selected(name: str) -> None:
-    svg_slot.clear()
+    trains_svg_slot.clear()
+    test_svg_slot.clear()
+    test_legend_container.clear()
     dynamic_container.clear()
     summary_table.rows = []
     summary_table.update()
@@ -785,22 +882,28 @@ def load_selected(name: str) -> None:
         ui.label("Load a cassette to see trains.").classes(
             "text-sm text-gray-400"
         )
+    with test_legend_container:
+        ui.label("Run a test to see results.").classes(
+            "text-sm text-gray-400"
+        )
 
-    # reset test/view state on every (re)load; keep the run button
-    # disabled until a cassette is fully loaded (table + display done)
+    # reset test/view state on every (re)load
     state["model"] = None
     state["test_results"] = {}
     state["view_mode"] = "trains"
     state["test_in_progress"] = False
+    state["test_svg_history"] = []
+    state["test_svg_index"] = -1
     progress_container.style("display:none;")
     _update_toggle_buttons()
+    _update_save_button()
 
     if not name:
         return
 
     filepath = CASSETTE_DIR / f"{name}.dxf"
     if not filepath.exists():
-        with svg_slot:
+        with trains_svg_slot:
             ui.label(
                 f"No file named '{name}.dxf' in cassette_layouts/."
             ).classes("text-red-400")
@@ -814,7 +917,7 @@ def load_selected(name: str) -> None:
     try:
         model = load_cassette(str(filepath), name)
     except Exception as ex:
-        with svg_slot:
+        with trains_svg_slot:
             ui.label(f"Failed to load {name}: {ex}").classes("text-red-400")
         return
 
@@ -843,6 +946,7 @@ def load_selected(name: str) -> None:
 
     _render_view()
     _update_toggle_buttons()
+    _update_save_button()
 
     # cassette is fully loaded (table + display populated) -- enable the
     # run button so a test can be executed for this cassette.
@@ -852,16 +956,6 @@ def load_selected(name: str) -> None:
                 "▶ Run Cassette Test",
                 on_click=run_tests,
             ).classes("green-background flex-1")
-            # Test-history navigation: arrow buttons to browse through
-            # previously generated test SVGs.
-            state["test_toggle_left"] = ui.button(icon="arrow_back").props(
-                "flat round dense color=blue-grey-4"
-            ).props("disabled").tooltip("Previous test result")
-            state["test_toggle_right"] = ui.button(icon="arrow_forward").props(
-                "flat round dense color=blue-grey-4"
-            ).props("disabled").tooltip("Next test result")
-            state["test_toggle_left"].on_click(_on_test_toggle_left)
-            state["test_toggle_right"].on_click(_on_test_toggle_right)
 
 
 # Register the input callback last, after run_button and all handler

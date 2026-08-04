@@ -962,6 +962,51 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
                     )
 
 
+def save_dxf(model: CassetteModel, filepath: str) -> None:
+    """Export a CassetteModel back to a DXF file.
+
+    Writes module outlines + hatches to the SHAPES layer, engine circles to
+    the ENGINES layer, and module/train labels to the TEXT layer.
+    """
+    doc = ezdxf.new(dxfversion="R2010")
+    msp = doc.modelspace()
+
+    for m in model.modules:
+        pts = [(float(x), float(y)) for x, y in m.polygon]
+        msp.add_lwpolyline(pts, dxfattribs={"layer": "SHAPES", "color": _aci_for_key(m.color_key)}, close=True)
+        hatch = msp.add_hatch(color=_aci_for_key(m.color_key), dxfattribs={"layer": "SHAPES"})
+        hatch.paths.add_polyline_path(pts, is_closed=True)
+        cx, cy = m.centroid
+        msp.add_mtext(
+            f"{m.code}\n({m.uv[0]},{m.uv[1]})" if m.uv else m.code,
+            dxfattribs={"layer": "TEXT", "color": 250, "insert": (cx, cy)},
+        )
+
+    for e in model.engines:
+        cx, cy = e.center
+        msp.add_circle((cx, cy), e.radius, dxfattribs={"layer": "ENGINES", "color": _aci_for_key(e.color_key)})
+
+    for t in model.trains:
+        if _is_real_train_label(t.label):
+            mods = [m for m in model.modules if m.train_id == t.id]
+            if mods:
+                cx = sum(m.centroid[0] for m in mods) / len(mods)
+                cy = sum(m.centroid[1] for m in mods) / len(mods)
+                msp.add_mtext(t.label, dxfattribs={"layer": "TEXT", "color": TRAIN_LABEL_COLOR, "insert": (cx, cy)})
+
+    doc.saveas(filepath)
+
+
+def _aci_for_key(color_key: str) -> int:
+    """Extract the ACI color number from a color_key like 'aci:32'."""
+    if color_key.startswith("aci:"):
+        try:
+            return int(color_key.split(":")[1])
+        except (ValueError, IndexError):
+            pass
+    return 7
+
+
 def summarize(model: CassetteModel) -> CassetteSummary:
     full_hex = sum(1 for m in model.modules if m.shape == "hex_full")
     partial_hex = sum(1 for m in model.modules if m.shape == "hex_partial")
