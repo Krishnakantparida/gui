@@ -758,6 +758,55 @@ def _enrich_from_json(model: CassetteModel, json_path: Path) -> None:
         if isinstance(half_data, dict):
             train_entries.update(half_data)
 
+    # --- Correct train labels using JSON (u,v) coordinates ---
+    # The greedy nearest-module assignment in load_cassette can swap
+    # nearby trains (e.g. LD4/LD5). The JSON has exact (u,v) per module,
+    # so we match each JSON train to the color-based train whose modules
+    # share the most (u,v) coordinates.
+    json_uvs_by_label: dict[str, set[tuple[int, int]]] = {}
+    for tlabel, tentry in train_entries.items():
+        if not isinstance(tentry, dict):
+            continue
+        uvs: set[tuple[int, int]] = set()
+        for mcode, mval in tentry.items():
+            if not isinstance(mval, dict):
+                continue
+            u = mval.get("u")
+            v = mval.get("v")
+            if u is not None and v is not None:
+                uvs.add((u, v))
+        if uvs:
+            json_uvs_by_label[tlabel] = uvs
+
+    model_uvs_by_train: dict[str, set[tuple[int, int]]] = {}
+    for m in model.modules:
+        if m.uv is not None:
+            model_uvs_by_train.setdefault(m.train_id, set()).add(m.uv)
+
+    if json_uvs_by_label and model_uvs_by_train:
+        # Reset all train labels to default so we can reassign cleanly
+        for i, t in enumerate(model.trains):
+            t.label = f"Train {i + 1}"
+        used_trains: set[str] = set()
+        # Sort JSON labels so we assign the most-constrained (fewest UVs) first
+        for tlabel in sorted(json_uvs_by_label, key=lambda l: len(json_uvs_by_label[l])):
+            json_uvs = json_uvs_by_label[tlabel]
+            best_train = None
+            best_overlap = 0
+            for tid, mod_uvs in model_uvs_by_train.items():
+                if tid in used_trains:
+                    continue
+                overlap = len(json_uvs & mod_uvs)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_train = tid
+            if best_train is not None and best_overlap > 0:
+                for t in model.trains:
+                    if t.id == best_train:
+                        t.label = tlabel
+                        break
+                used_trains.add(best_train)
+
     # Build lookup: train_label -> train_id (from model.trains)
     label_to_train_id = {t.label: t.id for t in model.trains}
 
