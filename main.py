@@ -50,7 +50,9 @@ corner of the display region toggle between the trains view and the
 test-results view.
 """
 
-# package listings
+#######################################################################################################
+# 2. PACKAGE LISTINGS
+#######################################################################################################
 import os
 import io
 import sys
@@ -58,10 +60,10 @@ import pytest
 import easysnmp
 import asyncio
 import json
-from pathlib import Path
-from easysnmp import Session
 import random
 import tempfile
+from pathlib import Path
+from easysnmp import Session
 
 import ezdxf
 from ezdxf.addons.drawing import RenderContext, Frontend
@@ -81,8 +83,9 @@ from svg_builder import build_svg, build_test_svg
 
 from nicegui import ui, app
 
+
 #######################################################################################################
-# Configuration and Global UI Variables (declared at module level)
+# 3. GLOBAL VARIABLES AND CONFIGURATIONS
 #######################################################################################################
 
 TEST_SCRIPT = Path("/home/hgcal_dev/pytest_dev/dev_gui/test_mpod_ctrl/scripts/test_powerSupply.py")
@@ -100,14 +103,17 @@ SHAPE_LABELS = {
 # Ensure report directory exists
 REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+# Global UI variable placeholders (populated when the display section builds)
 log = None
 report_table = None
 summary_label = None
 is_test_running = False
-scene = None
-group = None
+dark_mode = None
 
-# state shared between the input handler, the legend, and the test workflow
+# Available cassette names (populated in the display section)
+available: list[str] = []
+
+# State shared between the input handler, the legend, and the test workflow
 state = {
     "model": None,            # last loaded CassetteModel
     "visible_trains": {},      # train_id -> bool (trains view)
@@ -129,14 +135,7 @@ state = {
     "save_button": None,       # ui.Button for DXF export (created dynamically)
 }
 
-#######################################################################################################
-# CSS Styling and theme
-#######################################################################################################
-
-# button colour controls
-# legend checkbox
-# dimming functionality
-# Cassette display toggle for light and dark theme
+# ---- CSS Styling and theme ----
 ui.add_css('''
     @layer utilities {
        .red-background {
@@ -290,7 +289,7 @@ ui.add_css('''
     }
 ''')
 
-# Cassette display controls
+# ---- Cassette display hover/tooltip JS + visibility toggle JS ----
 ui.add_head_html(
     """
     <script>
@@ -386,7 +385,7 @@ ui.add_head_html(
     """
 )
 
-# MPOD test Table appearance controls
+# ---- MPOD test table appearance controls ----
 ui.add_css('''
     .test-table {
         font-size: 0.9em;
@@ -428,7 +427,7 @@ dark_mode.enable()  # start in dark mode
 
 
 #######################################################################################################
-# Utility Functions
+# 4. ALL UI AND INTERACTIVE FUNCTIONS
 #######################################################################################################
 
 def discover_cassettes() -> list[str]:
@@ -447,388 +446,81 @@ def _on_theme_toggle(e):
         ui.run_javascript('document.body.classList.add("cassette-light");')
 
 
-def load_report_data():
-    """Load report and extract test data for table display"""
-    if REPORT_FILE.exists():
-        try:
-            with open(REPORT_FILE) as f:
-                report = json.load(f)
-                
-                # Extract summary
-                summary = report.get("summary", {})
-                passed = summary.get("passed", 0)
-                total = summary.get("total", 0)
-                collected = summary.get("collected", 0)
-                deselected = summary.get("deselected", 0)
-                
-                # Extract test details
-                tests = report.get("tests", [])
-                
-                return {
-                    "summary": summary,
-                    "passed": passed,
-                    "total": total,
-                    "collected": collected,
-                    "deselected": deselected,
-                    "tests": tests
-                }
-        except Exception as e:
-            print(f"Error loading report: {e}")
-            return None
-    return None
+# ---- Test history navigation (arrow buttons) ----
 
-
-def update_summary_stats():
-    """Update the summary statistics label"""
-    global summary_label
-    summary_data = load_report_data()
-    
-    if summary_data and summary_label:
-        total = summary_data['total']
-        passed = summary_data['passed']
-        deselected = summary_data['deselected']
-        summary_label.text = f"Total: {total} | Passed: {passed} | Deselected: {deselected}"
-
-
-def refresh_report_table():
-    """Refresh the report table with latest data"""
-    global report_table
-    summary_data = load_report_data()
-    
-    if summary_data and summary_data['tests'] and report_table is not None:
-        rows = []
-        for test in summary_data['tests'][:50]:  # Show first 50 tests for performance
-            test_nodeid = test.get('nodeid', '')
-            test_name = test_nodeid.split('::')[-1] if '::' in test_nodeid else test_nodeid
-            
-            call_data = test.get('call', {})
-            duration_ms = call_data.get('duration', 0) * 1000
-            outcome = test.get('outcome', 'unknown').upper()
-            
-            rows.append({
-                'test_name': test_name,
-                'outcome': outcome,
-                'duration': f"{duration_ms:.2f}",
-                'line_no': test.get('lineno', '-'),
-            })
-        
-        # Update table rows (use update method instead of setting rows directly)
-        report_table.rows = rows
-        report_table.update()
-        update_summary_stats()
-
-
-async def update_report_continuously():
-    """Continuously refresh the report while tests are running."""
-    while is_test_running:
-        try:
-            refresh_report_table()
-        except Exception as e:
-            print(f"Error updating report: {e}")
-        
-        await asyncio.sleep(1)
-
-# MPOD test (configured for VCUs available in Fermilab SiDet Lab C)
-async def run_mpod_tests():
-    """Run pytest tests and display live output"""
-    global is_test_running
-    
-    if is_test_running:
-        ui.notify("Tests already running", color="warning")
+def _update_toggle_buttons() -> None:
+    tl = state.get("test_toggle_left")
+    tr = state.get("test_toggle_right")
+    if tl is None or tr is None:
         return
-    
-    is_test_running = True
-    run_button.enabled = False
-    
-    try:
-        log.clear()
-        
-        # Remove old report file
-        if REPORT_FILE.exists():
-            REPORT_FILE.unlink()
-        
-        # Start continuous report update task
-        update_task = asyncio.create_task(update_report_continuously())
-        
-        # Run pytest
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m", "pytest",
-            str(TEST_SCRIPT),
-            "--json-report",
-            f"--json-report-file={REPORT_FILE}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        
-        # Stream output to log
-        while True:
-            line = await process.stdout.readline()
-            
-            if not line:
-                break
-            
-            log.push(line.decode().rstrip())
-        
-        returncode = await process.wait()
-        
-        # Stop update task
-        update_task.cancel()
-        try:
-            await update_task
-        except asyncio.CancelledError:
-            pass
-        
-        # Final update
-        refresh_report_table()
-        
-        # Notify result
-        if returncode == 0:
-            ui.notify("✓ All Tests Passed", color="positive")
-        else:
-            ui.notify("✗ Some Tests Failed", color="negative")
-    
-    except Exception as e:
-        ui.notify(f"Error running tests: {str(e)}", color="negative")
-        log.push(f"ERROR: {str(e)}")
-    
-    finally:
-        is_test_running = False
-        run_button.enabled = True
-
-# Cassette baseline test 
-# (placeholder with RNG, to be updated with actual test guided using fe_micromanager)
-async def run_tests() -> None:
-    """Run a (simulated) cassette test and display per-module results.
-
-    Uses the model already loaded by ``load_selected`` -- the run button is
-    kept disabled until that load completes, so ``state["model"]`` is
-    guaranteed to be set when this handler fires.
-    """
-    model = state["model"]
-    if model is None or state["test_in_progress"]:
+    history = state.get("test_svg_history", [])
+    idx = state.get("test_svg_index", -1)
+    if not history or idx < 0:
+        tl.props("disabled")
+        tr.props("disabled")
         return
+    if idx > 0:
+        tl.props(remove="disabled")
+    else:
+        tl.props("disabled")
+    if idx < len(history) - 1:
+        tr.props(remove="disabled")
+    else:
+        tr.props("disabled")
 
-    state["test_in_progress"] = True
 
-    # show the progress overlay and reset the bar
-    progress_container.style("display:flex;")
-    progress_container.update()
-    progress_bar.value = 0.0
-    progress_bar.update()
-    progress_label.text = "Running cassette test..."
-    progress_label.update()
-
-    # simulate test work with incremental progress
-    for pct in range(0, 101, 5):
-        progress_bar.value = pct / 100.0
-        progress_bar.update()
-        await asyncio.sleep(0.05)
-
-    progress_label.text = "Test complete!"
-    progress_label.update()
-    await asyncio.sleep(0.2)
-
-    # classify ~5% of modules as failed, rest pass
-    module_ids = [m.id for m in model.modules]
-    fail_count = max(1, round(len(module_ids) * 0.05)) if module_ids else 0
-    failed = set(random.sample(module_ids, fail_count)) if module_ids else set()
-    results = {mid: (mid not in failed) for mid in module_ids}
-    state["test_results"] = results
-
-    # hide the progress overlay
-    progress_container.style("display:none;")
-    progress_container.update()
-
-    # switch to the test-results view
-    state["view_mode"] = "test"
-    _render_view()
-
-    # Save this test SVG to history for arrow-button navigation
-    svg_file = state.get("test_svg_file")
-    if svg_file:
-        state["test_svg_history"].append(svg_file)
-        state["test_svg_index"] = len(state["test_svg_history"]) - 1
+def _on_test_toggle_left() -> None:
+    history = state.get("test_svg_history", [])
+    idx = state.get("test_svg_index", -1)
+    if idx > 0:
+        state["test_svg_index"] = idx - 1
+        svg_content = _load_svg_temp(history[idx - 1])
+        if svg_content is not None:
+            _render_svg_content(svg_content, test_svg_slot)
+            model = state["model"]
+            if model is not None:
+                _render_test_legend(model, state["test_results"])
     _update_toggle_buttons()
-    _update_save_button()
-
-    state["test_in_progress"] = False
 
 
-#######################################################################################################
-# UI Header Layout
-#######################################################################################################
-with ui.row().classes('w-full items-center justify-between'):
-
-    with ui.row().classes("items-center gap-4 no-wrap"):
-        # CMS logo first
-        with ui.column().classes("gap-0"):
-            ui.image("standard_images/CMS_logo-002.png").style(
-                "height:90px; width:90px;"
-            ).props("alt=CMS logo")
-        # then the title
-        with ui.column().classes("gap-0"):
-            ui.label("High Granularity Calorimeter (CE-H)").style(
-                "font-size:24px;font-weight:bold;"
-            )
-            ui.label("Single Cassette Tester").style(
-                "font-size:24px;font-weight:bold;"
-            )
-
-    # Top-right dropdown menu section 
-    with ui.button(icon='menu').props('flat round'):
-        with ui.menu().props('trigger="hover"'):
-            with ui.menu_item(auto_close=False):
-                with ui.row().classes("items-center gap-3 no-wrap"):
-                    ui.label("Theme").classes("text-sm")
-                    ui.switch(
-                        value=True,
-                        on_change=lambda e: dark_mode.enable() if e.value else dark_mode.disable(),
-                    ).props('checked-icon="dark_mode" unchecked-icon="light_mode" color="blue-grey-7"')#.tooltip(
-                    #    "Toggle light / dark mode"
-                    #)
-
-            ui.menu_item('Test Workflow')
-            ui.menu_item('Documentation')
-            ui.menu_item('Settings')
-
-            ui.separator()
-
-            ui.menu_item(
-                '⏻ Shutdown',
-                on_click=lambda: app.shutdown()
-            ).classes('red-background')
-
-ui.separator()
-
-# =====================================================================================================
-# Cassette Information
-# =====================================================================================================
-with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
-    # =====================================================================================================
-    # LEFT COLUMN - Cassette Selection + summary table
-    # =====================================================================================================
-    with ui.column().classes("flex-1 gap-3"):
-        ui.markdown("## Cassette Information")
-
-        available = discover_cassettes()
-        placeholder = "e.g. Cassette_7B_33B"
-        if available:
-            placeholder = f"e.g. {available[0]}"
-        cassette_input = ui.input(
-            label="Cassette name:",
-            placeholder=placeholder,
-        ).classes("w-full").tooltip("Enter the .dxf filename without extension")
-
-        summary_table = (
-            ui.table(
-                columns=[
-                    {"name": "field", "label": "Field", "field": "field", "align": "left"},
-                    {"name": "value", "label": "Value", "field": "value", "align": "left"},
-                ],
-                rows=[],
-                row_key="field",
-            )
-            .classes("w-full")
-            .props("flat bordered hide-header")
-        )
-    
-
-    # =====================================================================================================
-    # ------------------- Functions needed by the UI layout below (defined early) -------------------------
-    # =====================================================================================================
-    def _update_toggle_buttons() -> None:
-        tl = state.get("test_toggle_left")
-        tr = state.get("test_toggle_right")
-        if tl is None or tr is None:
-            return
-        history = state.get("test_svg_history", [])
-        idx = state.get("test_svg_index", -1)
-        if not history or idx < 0:
-            tl.props("disabled")
-            tr.props("disabled")
-            return
-        if idx > 0:
-            tl.props(remove="disabled")
-        else:
-            tl.props("disabled")
-        if idx < len(history) - 1:
-            tr.props(remove="disabled")
-        else:
-            tr.props("disabled")
-
-    def _on_test_toggle_left() -> None:
-        history = state.get("test_svg_history", [])
-        idx = state.get("test_svg_index", -1)
-        if idx > 0:
-            state["test_svg_index"] = idx - 1
-            svg_content = _load_svg_temp(history[idx - 1])
-            if svg_content is not None:
-                _render_svg_content(svg_content, test_svg_slot)
-                model = state["model"]
-                if model is not None:
-                    _render_test_legend(model, state["test_results"])
-        _update_toggle_buttons()
-
-    def _on_test_toggle_right() -> None:
-        history = state.get("test_svg_history", [])
-        idx = state.get("test_svg_index", -1)
-        if idx < len(history) - 1:
-            state["test_svg_index"] = idx + 1
-            svg_content = _load_svg_temp(history[idx + 1])
-            if svg_content is not None:
-                _render_svg_content(svg_content, test_svg_slot)
-                model = state["model"]
-                if model is not None:
-                    _render_test_legend(model, state["test_results"])
-        _update_toggle_buttons()
-
-    def _update_save_button() -> None:
-        sb = state.get("save_button")
-        if sb is None:
-            return
-        if state.get("test_results"):
-            sb.props(remove="disabled")
-        else:
-            sb.props("disabled")
-
-    def _on_save_dxf() -> None:
-        model = state["model"]
-        if model is None:
-            return
-        import tempfile, os
-        fd, tmp_path = tempfile.mkstemp(suffix=".dxf", prefix="cassette_")
-        os.close(fd)
-        save_dxf(model, tmp_path)
-        ui.download(tmp_path)
+def _on_test_toggle_right() -> None:
+    history = state.get("test_svg_history", [])
+    idx = state.get("test_svg_index", -1)
+    if idx < len(history) - 1:
+        state["test_svg_index"] = idx + 1
+        svg_content = _load_svg_temp(history[idx + 1])
+        if svg_content is not None:
+            _render_svg_content(svg_content, test_svg_slot)
+            model = state["model"]
+            if model is not None:
+                _render_test_legend(model, state["test_results"])
+    _update_toggle_buttons()
 
 
-    # =====================================================================================================
-    # RIGHT COLUMN - Interactive cassette display (Cassette components and trains)
-    # =====================================================================================================
-    with ui.column().classes("flex-1 h-full"):
-        with (
-            ui.column()
-            .classes("w-full h-full border rounded-lg relative overflow-hidden")
-            .props('id="cassette-display-area"')
-            .style("position: relative; min-height: 0;")
-        ):
-            train_svg_slot = ui.element("div").classes(
-                "cassette-svg-wrap trains-svg-wrap w-full h-full flex items-center justify-center"
-            )
+# ---- Save DXF button ----
 
-            # Legend overlay pinned to the top-left corner of the display area
-            with ui.column().classes("legend-overlay gap-1") as legend_container:
-                legend_hint = ui.label("Load a cassette to see trains.").classes(
-                    "text-sm text-gray-400"
-                )
+def _update_save_button() -> None:
+    sb = state.get("save_button")
+    if sb is None:
+        return
+    if state.get("test_results"):
+        sb.props(remove="disabled")
+    else:
+        sb.props("disabled")
 
-            ui.element("div").props('id="cassette-tooltip"').classes(
-                "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
-            ).style(
-                "display:none; position:absolute; z-index:50; pointer-events:none; "
-                "max-width: 260px;"
-            )
+
+def _on_save_dxf() -> None:
+    model = state["model"]
+    if model is None:
+        return
+    import tempfile, os
+    fd, tmp_path = tempfile.mkstemp(suffix=".dxf", prefix="cassette_")
+    os.close(fd)
+    save_dxf(model, tmp_path)
+    ui.download(tmp_path)
+
+
+# ---- Legend rendering (trains view) ----
 
 def _render_legend(model) -> None:
     """Build the checkbox legend from the model's trains and engines."""
@@ -857,7 +549,7 @@ def _render_legend(model) -> None:
                 engine_types = sorted(
                     {e.engine_type for e in model.engines if e.train_id == t.id and e.engine_type}
                 )
-                label = f"Engine: {', '.join(engine_types)}" if engine_types else "Engine"            
+                label = f"Engine: {', '.join(engine_types)}" if engine_types else "Engine"
             with ui.row().classes("legend-row w-full items-center"):
                 cb = ui.checkbox(
                     text=t.label,
@@ -946,6 +638,33 @@ def _render_legend(model) -> None:
                 )
 
 
+# ---- Legend rendering (test results view) ----
+
+def _render_test_legend(model, results) -> None:
+    """Build the checkbox legend for the test-results view showing Pass/Fail counts."""
+    test_legend_container.clear()
+    with test_legend_container:
+        ui.label("Test Results").classes("text-sm text-gray-400")
+        passed = sum(1 for v in results.values() if v)
+        failed = sum(1 for v in results.values() if not v)
+        with ui.row().classes("legend-row w-full items-center"):
+            ui.checkbox(
+                text=f"Pass ({passed})",
+                value=True,
+                on_change=lambda e: _on_test_toggle("pass", e.value),
+            ).classes("flex-1").tooltip("Modules that passed the test")
+            ui.element("div").classes("legend-swatch").style("background:#22c55e;")
+        with ui.row().classes("legend-row w-full items-center"):
+            ui.checkbox(
+                text=f"Fail ({failed})",
+                value=True,
+                on_change=lambda e: _on_test_toggle("fail", e.value),
+            ).classes("flex-1").tooltip("Modules that failed the test")
+            ui.element("div").classes("legend-swatch").style("background:#ef4444;")
+
+
+# ---- Visibility toggle handlers (trains view) ----
+
 def _on_train_toggle(train_id: str, visible: bool) -> None:
     state["visible_trains"][train_id] = visible
     ui.run_javascript(
@@ -988,11 +707,15 @@ def _on_engines_toggle(visible: bool) -> None:
     ui.run_javascript(f'setEnginesVisible({"true" if visible else "false"}, \'.trains-svg-wrap\');')
 
 
+# ---- Visibility toggle handler (test view) ----
+
 def _on_test_toggle(status: str, visible: bool) -> None:
     ui.run_javascript(
         f'setTrainVisible({status!r}, {"true" if visible else "false"}, \'.test-svg-wrap\');'
     )
 
+
+# ---- SVG temp file helpers ----
 
 def _save_svg_temp(svg_content: str, label: str) -> str | None:
     """Write SVG content to a temp file and return its path."""
@@ -1022,6 +745,8 @@ def _render_svg_content(svg_content: str, slot=None) -> None:
     with slot:
         ui.html(svg_content, sanitize=False).classes("w-full h-full")
 
+
+# ---- View rendering ----
 
 def _render_view() -> None:
     """Render SVGs for both display sections.
@@ -1084,14 +809,7 @@ def _render_view() -> None:
             )
 
 
-
-# ============================================================
-# Control Buttons -- created AFTER run_tests is defined so we can pass
-# it directly (NiceGUI awaits coroutine-function handlers; a lambda
-# wrapping a coroutine would NOT be awaited and the test would never run).
-# ============================================================
-dynamic_container = ui.row().classes("w-full") 
-
+# ---- Cassette loading ----
 
 def load_selected(name: str) -> None:
     trains_svg_slot.clear()
@@ -1121,10 +839,14 @@ def load_selected(name: str) -> None:
     _update_toggle_buttons()
     _update_save_button()
 
+    # reset cassette test summary table
+    cassette_test_summary_table.rows = []
+    cassette_test_summary_table.update()
+
     if not name:
         return
 
-    filepath = CASSETTE_DIR / f"{name}.dxf"
+    filepath = CASSETTE_PATH / f"{name}.dxf"
     if not filepath.exists():
         with trains_svg_slot:
             ui.label(
@@ -1174,55 +896,384 @@ def load_selected(name: str) -> None:
     # cassette is fully loaded (table + display populated) -- enable the
     # run button so a test can be executed for this cassette.
     with dynamic_container:
-        with ui.row().classes("w-1/4 gap-2 items-center"):
-            run_button = ui.button(
-                "▶ Run Cassette Test",
+        with ui.row().classes("w-full gap-2 items-center"):
+            cassette_run_button = ui.button(
+                "Run Cassette Test",
                 on_click=run_tests,
             ).classes("green-background flex-1")
 
 
+# ---- MPOD report data helpers ----
+
+def load_report_data():
+    """Load report and extract test data for table display"""
+    if REPORT_FILE.exists():
+        try:
+            with open(REPORT_FILE) as f:
+                report = json.load(f)
+
+                # Extract summary
+                summary = report.get("summary", {})
+                passed = summary.get("passed", 0)
+                total = summary.get("total", 0)
+                collected = summary.get("collected", 0)
+                deselected = summary.get("deselected", 0)
+
+                # Extract test details
+                tests = report.get("tests", [])
+
+                return {
+                    "summary": summary,
+                    "passed": passed,
+                    "total": total,
+                    "collected": collected,
+                    "deselected": deselected,
+                    "tests": tests
+                }
+        except Exception as e:
+            print(f"Error loading report: {e}")
+            return None
+    return None
+
+
+def update_summary_stats():
+    """Update the summary statistics label"""
+    global summary_label
+    summary_data = load_report_data()
+
+    if summary_data and summary_label:
+        total = summary_data['total']
+        passed = summary_data['passed']
+        deselected = summary_data['deselected']
+        summary_label.text = f"Total: {total} | Passed: {passed} | Deselected: {deselected}"
+
+
+def refresh_report_table():
+    """Refresh the report table with latest data"""
+    global report_table
+    summary_data = load_report_data()
+
+    if summary_data and summary_data['tests'] and report_table is not None:
+        rows = []
+        for test in summary_data['tests'][:50]:  # Show first 50 tests for performance
+            test_nodeid = test.get('nodeid', '')
+            test_name = test_nodeid.split('::')[-1] if '::' in test_nodeid else test_nodeid
+
+            call_data = test.get('call', {})
+            duration_ms = call_data.get('duration', 0) * 1000
+            outcome = test.get('outcome', 'unknown').upper()
+
+            rows.append({
+                'test_name': test_name,
+                'outcome': outcome,
+                'duration': f"{duration_ms:.2f}",
+                'line_no': test.get('lineno', '-'),
+            })
+
+        # Update table rows (use update method instead of setting rows directly)
+        report_table.rows = rows
+        report_table.update()
+        update_summary_stats()
+
+
+async def update_report_continuously():
+    """Continuously refresh the report while tests are running."""
+    while is_test_running:
+        try:
+            refresh_report_table()
+        except Exception as e:
+            print(f"Error updating report: {e}")
+
+        await asyncio.sleep(1)
+
+
+#######################################################################################################
+# 5. ALL MAJOR TEST FUNCTIONS
+#######################################################################################################
+
+# MPOD test (configured for VCUs available in Fermilab SiDet Lab C)
+async def run_mpod_tests():
+    """Run pytest tests and display live output"""
+    global is_test_running
+
+    if is_test_running:
+        ui.notify("Tests already running", color="warning")
+        return
+
+    is_test_running = True
+    mpod_run_button.enabled = False
+
+    try:
+        log.clear()
+
+        # Remove old report file
+        if REPORT_FILE.exists():
+            REPORT_FILE.unlink()
+
+        # Start continuous report update task
+        update_task = asyncio.create_task(update_report_continuously())
+
+        # Run pytest
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m", "pytest",
+            str(TEST_SCRIPT),
+            "--json-report",
+            f"--json-report-file={REPORT_FILE}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        # Stream output to log
+        while True:
+            line = await process.stdout.readline()
+
+            if not line:
+                break
+
+            log.push(line.decode().rstrip())
+
+        returncode = await process.wait()
+
+        # Stop update task
+        update_task.cancel()
+        try:
+            await update_task
+        except asyncio.CancelledError:
+            pass
+
+        # Final update
+        refresh_report_table()
+
+        # Notify result
+        if returncode == 0:
+            ui.notify("All Tests Passed", color="positive")
+        else:
+            ui.notify("Some Tests Failed", color="negative")
+
+    except Exception as e:
+        ui.notify(f"Error running tests: {str(e)}", color="negative")
+        log.push(f"ERROR: {str(e)}")
+
+    finally:
+        is_test_running = False
+        mpod_run_button.enabled = True
+
+
+# Cassette baseline test
+# (placeholder with RNG, to be updated with actual test guided using fe_micromanager)
+async def run_tests() -> None:
+    """Run a (simulated) cassette test and display per-module results.
+
+    Uses the model already loaded by ``load_selected`` -- the run button is
+    kept disabled until that load completes, so ``state["model"]`` is
+    guaranteed to be set when this handler fires.
+    """
+    model = state["model"]
+    if model is None or state["test_in_progress"]:
+        return
+
+    state["test_in_progress"] = True
+
+    # show the progress overlay and reset the bar
+    progress_container.style("display:flex;")
+    progress_container.update()
+    progress_bar.value = 0.0
+    progress_bar.update()
+    progress_label.text = "Running cassette test..."
+    progress_label.update()
+
+    # simulate test work with incremental progress
+    for pct in range(0, 101, 5):
+        progress_bar.value = pct / 100.0
+        progress_bar.update()
+        await asyncio.sleep(0.05)
+
+    progress_label.text = "Test complete!"
+    progress_label.update()
+    await asyncio.sleep(0.2)
+
+    # classify ~5% of modules as failed, rest pass
+    module_ids = [m.id for m in model.modules]
+    fail_count = max(1, round(len(module_ids) * 0.05)) if module_ids else 0
+    failed = set(random.sample(module_ids, fail_count)) if module_ids else set()
+    results = {mid: (mid not in failed) for mid in module_ids}
+    state["test_results"] = results
+
+    # update cassette test summary table
+    passed_count = sum(1 for v in results.values() if v)
+    failed_count = sum(1 for v in results.values() if not v)
+    cassette_test_summary_table.rows = [
+        {"status": "Total Modules", "count": len(results)},
+        {"status": "Passed", "count": passed_count},
+        {"status": "Failed", "count": failed_count},
+    ]
+    cassette_test_summary_table.update()
+
+    # hide the progress overlay
+    progress_container.style("display:none;")
+    progress_container.update()
+
+    # switch to the test-results view
+    state["view_mode"] = "test"
+    _render_view()
+
+    # Save this test SVG to history for arrow-button navigation
+    svg_file = state.get("test_svg_file")
+    if svg_file:
+        state["test_svg_history"].append(svg_file)
+        state["test_svg_index"] = len(state["test_svg_history"]) - 1
+    _update_toggle_buttons()
+    _update_save_button()
+
+    state["test_in_progress"] = False
+
+
+#######################################################################################################
+# 6. DISPLAY SECTION
+#######################################################################################################
+
+# =====================================================================================================
+# 6a. UI Header (logo, heading, and dropdown menu)
+# =====================================================================================================
+with ui.row().classes('w-full items-center justify-between'):
+
+    with ui.row().classes("items-center gap-4 no-wrap"):
+        # CMS logo first
+        with ui.column().classes("gap-0"):
+            ui.image("standard_images/CMS_logo-002.png").style(
+                "height:90px; width:90px;"
+            ).props("alt=CMS logo")
+        # then the title
+        with ui.column().classes("gap-0"):
+            ui.label("High Granularity Calorimeter (CE-H)").style(
+                "font-size:24px;font-weight:bold;"
+            )
+            ui.label("Single Cassette Tester").style(
+                "font-size:24px;font-weight:bold;"
+            )
+
+    # Top-right dropdown menu section
+    with ui.button(icon='menu').props('flat round'):
+        with ui.menu().props('trigger="hover"'):
+            with ui.menu_item(auto_close=False):
+                with ui.row().classes("items-center gap-3 no-wrap"):
+                    ui.label("Theme").classes("text-sm")
+                    ui.switch(
+                        value=True,
+                        on_change=lambda e: dark_mode.enable() if e.value else dark_mode.disable(),
+                    ).props('checked-icon="dark_mode" unchecked-icon="light_mode" color="blue-grey-7"')
+
+            ui.menu_item('Test Workflow')
+            ui.menu_item('Documentation')
+            ui.menu_item('Settings')
+
+            ui.separator()
+
+            ui.menu_item(
+                'Shutdown',
+                on_click=lambda: app.shutdown()
+            ).classes('red-background')
+
+ui.separator()
+
+# =====================================================================================================
+# 6b. Cassette Information
+#    LEFT: Cassette name entry box + summary table
+#    RIGHT: Interactive display for trains and all components
+# =====================================================================================================
+with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
+    # ---- LEFT COLUMN: Cassette Selection + summary table ----
+    with ui.column().classes("flex-1 gap-3"):
+        ui.markdown("## Cassette Information")
+
+        available = discover_cassettes()
+        placeholder = "e.g. Cassette_7B_33B"
+        if available:
+            placeholder = f"e.g. {available[0]}"
+        cassette_input = ui.input(
+            label="Cassette name:",
+            placeholder=placeholder,
+        ).classes("w-full").tooltip("Enter the .dxf filename without extension")
+
+        summary_table = (
+            ui.table(
+                columns=[
+                    {"name": "field", "label": "Field", "field": "field", "align": "left"},
+                    {"name": "value", "label": "Value", "field": "value", "align": "left"},
+                ],
+                rows=[],
+                row_key="field",
+            )
+            .classes("w-full")
+            .props("flat bordered hide-header")
+        )
+
+    # ---- RIGHT COLUMN: Interactive cassette display ----
+    with ui.column().classes("flex-1 h-full"):
+        with (
+            ui.column()
+            .classes("w-full h-full border rounded-lg relative overflow-hidden")
+            .props('id="cassette-display-area"')
+            .style("position: relative; min-height: 0;")
+        ):
+            trains_svg_slot = ui.element("div").classes(
+                "cassette-svg-wrap trains-svg-wrap w-full h-full flex items-center justify-center"
+            )
+
+            # Legend overlay pinned to the top-left corner of the display area
+            with ui.column().classes("legend-overlay gap-1") as legend_container:
+                legend_hint = ui.label("Load a cassette to see trains.").classes(
+                    "text-sm text-gray-400"
+                )
+
+            ui.element("div").props('id="cassette-tooltip"').classes(
+                "absolute rounded-md border px-3 py-2 text-sm shadow-lg whitespace-pre-line"
+            ).style(
+                "display:none; position:absolute; z-index:50; pointer-events:none; "
+                "max-width: 260px;"
+            )
+
+# Bind cassette input changes to the load handler
 cassette_input.on_value_change(lambda e: load_selected(e.value))
 
 ui.separator()
 
-# ============================================================
-# MPOD Information
-# ============================================================
-# Main layout with left and right columns
+# =====================================================================================================
+# 6c. MPOD Testing
+#    LEFT: MPOD ID + Run MPOD Test button + output log
+#    RIGHT: Pytest report table
+# =====================================================================================================
 with ui.row().classes("w-full gap-4"):
-    
-    # ============================================================
-    # LEFT COLUMN - Controls and Logs
-    # ============================================================
+
+    # ---- LEFT COLUMN: Controls and Logs ----
     with ui.column().classes("flex-1"):
-        
+
         ui.markdown("## MPOD Information")
         ui.label(f"MPOD IP: {MPOD_IP}").style("font-weight: bold;")
-        
+
         # Control Buttons
         with ui.row().classes("w-1/2 gap-2"):
-            run_button = ui.button(
-                "▶ Run MPOD Tests",
+            mpod_run_button = ui.button(
+                "Run MPOD Tests",
                 on_click=run_mpod_tests,
             ).classes("green-background flex-1")
-        
+
         ui.separator()
-        
+
         # Pytest Logs
         ui.markdown("## Pytest Logs")
         log = ui.log().classes("w-full h-96 border")
-    
-    # ============================================================
-    # RIGHT COLUMN - Report Table
-    # ============================================================
+
+    # ---- RIGHT COLUMN: Report Table ----
     with ui.column().classes("flex-1"):
-        
+
         ui.markdown("## Pytest Report")
-        
+
         # Summary Statistics
         with ui.row().classes("w-full gap-4 mb-4"):
             summary_label = ui.label("No tests run yet").style("font-weight: bold;")
-        
+
         # Test Results Table
         columns = [
             {'name': 'test_name', 'label': 'Test Name', 'field': 'test_name', 'align': 'left'},
@@ -1230,80 +1281,86 @@ with ui.row().classes("w-full gap-4"):
             {'name': 'duration', 'label': 'Duration (ms)', 'field': 'duration', 'align': 'right'},
             {'name': 'line_no', 'label': 'Line No', 'field': 'line_no', 'align': 'center'},
         ]
-        
+
         report_table = ui.table(
-            columns=columns, 
+            columns=columns,
             rows=[]
         ).classes("test-table w-full").props('table-style="max-height: 525px"')
-        
-        # Initial load if report exists - only if file exists
-        #if REPORT_FILE.exists():
-        #    initial_data = load_report_data()
-        #    if initial_data and initial_data['tests']:
-        #        refresh_report_table()
 
 ui.separator()
 
-######################################################################
-# Running and Displaying Cassette test and its results 
-######################################################################
+# =====================================================================================================
+# 6d. Cassette Testing
+#    LEFT: Run Cassette Test button + summary table (pass/fail counts)
+#    RIGHT: Interactive display for tested cassettes (arrows + save button)
+# =====================================================================================================
 with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
-    # ============================================================
-    # LEFT COLUMN - Test Control Button
-    # ============================================================
-    with ui.row().classes("w-1/4 gap-2"):
-        run_button = ui.button(
-            "▶ Run Cassette Test",
-            on_click=run_tests,
-        ).classes("green-background flex-1")
+    # ---- LEFT COLUMN: Test Control Button + Summary Table ----
+    with ui.column().classes("w-1/4 gap-3"):
+        ui.markdown("## Cassette Test")
 
-    # ============================================================
-    # RIGHT COLUMN - interactive tested cassette display
-    # ============================================================
-    with (
-            ui.column()
-            .classes("w-full flex-1 border rounded-lg relative overflow-hidden")
-            .props('id="test-display-area"')
-            .style("position: relative; min-height: 0;")
-        ):
-            test_svg_slot = ui.element("div").classes(
-                "cassette-svg-wrap test-svg-wrap w-full h-full flex items-center justify-center"
+        # Dynamic container for the run button (populated when a cassette loads)
+        dynamic_container = ui.row().classes("w-full")
+
+        ui.separator()
+
+        ui.markdown("### Test Summary")
+        cassette_test_summary_table = (
+            ui.table(
+                columns=[
+                    {"name": "status", "label": "Status", "field": "status", "align": "left"},
+                    {"name": "count", "label": "Count", "field": "count", "align": "center"},
+                ],
+                rows=[],
+                row_key="status",
             )
-            with ui.column().classes("legend-overlay gap-1") as test_legend_container:
-                ui.label("Run a test to see results.").classes(
-                    "text-sm text-gray-400"
-                )
-            # Arrow + save buttons pinned to top-right of test display
-            with ui.row().classes("test-display-buttons") as test_buttons_row:
-                state["test_toggle_left"] = ui.button(icon="arrow_back").props(
-                    "flat round dense color=blue-grey-4"
-                ).props("disabled").tooltip("Previous test result")
-                state["test_toggle_right"] = ui.button(icon="arrow_forward").props(
-                    "flat round dense color=blue-grey-4"
-                ).props("disabled").tooltip("Next test result")
-                state["save_button"] = ui.button(icon="save").props(
-                    "flat round dense color=blue-grey-4"
-                ).props("disabled").tooltip("Save tested cassette as .dxf")
-                state["test_toggle_left"].on_click(_on_test_toggle_left)
-                state["test_toggle_right"].on_click(_on_test_toggle_right)
-                state["save_button"].on_click(_on_save_dxf)
+            .classes("w-full")
+            .props("flat bordered")
+        )
 
-            # Progress-bar overlay shown while a test is running.
-            with ui.column().classes("progress-overlay") as progress_container:
-                progress_label = ui.label("Running cassette test...").classes(
-                    "text-sm text-gray-200 mb-2"
-                )
-                progress_bar = ui.linear_progress(value=0).props(
-                    "color=green-6 rounded"
-                ).classes("w-full")
-            progress_container.style("display:none;")
+    # ---- RIGHT COLUMN: Interactive tested cassette display ----
+    with (
+        ui.column()
+        .classes("w-full flex-1 border rounded-lg relative overflow-hidden")
+        .props('id="test-display-area"')
+        .style("position: relative; min-height: 0;")
+    ):
+        test_svg_slot = ui.element("div").classes(
+            "cassette-svg-wrap test-svg-wrap w-full h-full flex items-center justify-center"
+        )
+        with ui.column().classes("legend-overlay gap-1") as test_legend_container:
+            ui.label("Run a test to see results.").classes(
+                "text-sm text-gray-400"
+            )
+        # Arrow + save buttons pinned to top-right of test display
+        with ui.row().classes("test-display-buttons") as test_buttons_row:
+            state["test_toggle_left"] = ui.button(icon="arrow_back").props(
+                "flat round dense color=blue-grey-4"
+            ).props("disabled").tooltip("Previous test result")
+            state["test_toggle_right"] = ui.button(icon="arrow_forward").props(
+                "flat round dense color=blue-grey-4"
+            ).props("disabled").tooltip("Next test result")
+            state["save_button"] = ui.button(icon="save").props(
+                "flat round dense color=blue-grey-4"
+            ).props("disabled").tooltip("Save tested cassette as .dxf")
+            state["test_toggle_left"].on_click(_on_test_toggle_left)
+            state["test_toggle_right"].on_click(_on_test_toggle_right)
+            state["save_button"].on_click(_on_save_dxf)
+
+        # Progress-bar overlay shown while a test is running.
+        with ui.column().classes("progress-overlay") as progress_container:
+            progress_label = ui.label("Running cassette test...").classes(
+                "text-sm text-gray-200 mb-2"
+            )
+            progress_bar = ui.linear_progress(value=0).props(
+                "color=green-6 rounded"
+            ).classes("w-full")
+        progress_container.style("display:none;")
 
 
-
-
-######################################################################
-# Running GUI at port 9000
-######################################################################
+#######################################################################################################
+# Running GUI at Port 9000
+#######################################################################################################
 
 ui.run(
     title="[HGCAL] Single Cassette Tester",
