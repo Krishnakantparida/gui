@@ -154,8 +154,8 @@ ui.add_css('''
            color: white !important;
         }
        .yellow-background {
-           background-color: yellow !important;
-           color: white !important;
+           background-color: #facc15 !important;
+           color: #1a1a1a !important;
         }
     }
     .legend-row { gap: 6px; }
@@ -279,6 +279,20 @@ ui.add_css('''
     .cassette-light .legend-overlay .text-gray-400 {
         color: #475569 !important;
     }
+    .cassette-light .legend-overlay .q-checkbox__label {
+        color: #1e293b !important;
+    }
+    .cassette-light .legend-overlay .q-checkbox__inner {
+        color: #475569 !important;
+    }
+    .cassette-light .test-display-buttons {
+        border-color: rgba(100, 116, 139, 0.35);
+        background: rgba(241, 245, 249, 0.88);
+    }
+    .cassette-light .progress-overlay {
+        border-color: rgba(100, 116, 139, 0.25);
+        background: rgba(241, 245, 249, 0.92);
+    }
     .cassette-light .progress-overlay .text-gray-200 {
         color: #0f172a !important;
     }
@@ -327,7 +341,7 @@ ui.add_head_html(
     // Toggle visibility of every SVG element belonging to a train. When a
     // train is unchecked, its modules/engines/labels are dimmed (not
     // removed) so the layout stays stable and re-toggling is instant.
-    function setTrainVisible(trainId, visible) {
+    function setTrainVisible(trainId, visible, wrapSelector) {
         const svg = document.querySelector((wrapSelector || '.cassette-svg-wrap') + ' svg');
         if (!svg) return;
         const sel = `[data-train="${CSS.escape(trainId)}"]`;
@@ -994,6 +1008,11 @@ async def update_report_continuously():
 # 5. ALL MAJOR TEST FUNCTIONS
 #######################################################################################################
 
+def start_mpod_server() -> None:
+    """Start the MPOD server (placeholder)."""
+    pass
+
+
 # MPOD test (configured for VCUs available in Fermilab SiDet Lab C)
 async def run_mpod_tests():
     """Run pytest tests and display live output"""
@@ -1051,6 +1070,8 @@ async def run_mpod_tests():
         # Notify result
         if returncode == 0:
             ui.notify("All Tests Passed", color="positive")
+            mpod_server_button.style("display: flex;")
+            mpod_server_button.update()
         else:
             ui.notify("Some Tests Failed", color="negative")
 
@@ -1164,7 +1185,7 @@ with ui.row().classes('w-full items-center justify-between'):
                     ui.label("Theme").classes("text-sm")
                     ui.switch(
                         value=True,
-                        on_change=lambda e: dark_mode.enable() if e.value else dark_mode.disable(),
+                        on_change=_on_theme_toggle,
                     ).props('checked-icon="dark_mode" unchecked-icon="light_mode" color="blue-grey-7"')
 
             ui.menu_item('Test Workflow')
@@ -1261,6 +1282,10 @@ with ui.row().classes("w-full gap-4"):
                 "Run MPOD Tests",
                 on_click=run_mpod_tests,
             ).classes("green-background flex-1")
+            mpod_server_button = ui.button(
+                "Start MPOD Server",
+                on_click=start_mpod_server,
+            ).classes("yellow-background flex-1").style("display: none;")
 
         ui.separator()
 
@@ -1322,43 +1347,44 @@ with ui.row().classes("w-full gap-4 flex-nowrap").style("height: 78vh;"):
         )
 
     # ---- RIGHT COLUMN: Interactive tested cassette display ----
-    with (
-        ui.column()
-        .classes("w-full flex-1 border rounded-lg relative overflow-hidden")
-        .props('id="test-display-area"')
-        .style("position: relative; min-height: 0;")
-    ):
-        test_svg_slot = ui.element("div").classes(
-            "cassette-svg-wrap test-svg-wrap w-full h-full flex items-center justify-center"
-        )
-        with ui.column().classes("legend-overlay gap-1") as test_legend_container:
-            ui.label("Run a test to see results.").classes(
-                "text-sm text-gray-400"
+    with ui.column().classes("flex-1 h-full"):
+        with (
+            ui.column()
+            .classes("w-full h-full border rounded-lg relative overflow-hidden")
+            .props('id="test-display-area"')
+            .style("position: relative; min-height: 0;")
+        ):
+            test_svg_slot = ui.element("div").classes(
+                "cassette-svg-wrap test-svg-wrap w-full h-full flex items-center justify-center"
             )
-        # Arrow + save buttons pinned to top-right of test display
-        with ui.row().classes("test-display-buttons") as test_buttons_row:
-            state["test_toggle_left"] = ui.button(icon="arrow_back").props(
-                "flat round dense color=blue-grey-4"
-            ).props("disabled").tooltip("Previous test result")
-            state["test_toggle_right"] = ui.button(icon="arrow_forward").props(
-                "flat round dense color=blue-grey-4"
-            ).props("disabled").tooltip("Next test result")
-            state["save_button"] = ui.button(icon="save").props(
-                "flat round dense color=blue-grey-4"
-            ).props("disabled").tooltip("Save tested cassette as .dxf")
-            state["test_toggle_left"].on_click(_on_test_toggle_left)
-            state["test_toggle_right"].on_click(_on_test_toggle_right)
-            state["save_button"].on_click(_on_save_dxf)
+            with ui.column().classes("legend-overlay gap-1") as test_legend_container:
+                ui.label("Run a test to see results.").classes(
+                    "text-sm text-gray-400"
+                )
+            # Arrow + save buttons pinned to top-right of test display
+            with ui.row().classes("test-display-buttons") as test_buttons_row:
+                state["test_toggle_left"] = ui.button(icon="arrow_back").props(
+                    "flat round dense color=blue-grey-4"
+                ).props("disabled").tooltip("Previous test result")
+                state["test_toggle_right"] = ui.button(icon="arrow_forward").props(
+                    "flat round dense color=blue-grey-4"
+                ).props("disabled").tooltip("Next test result")
+                state["save_button"] = ui.button(icon="save").props(
+                    "flat round dense color=blue-grey-4"
+                ).props("disabled").tooltip("Save tested cassette as .dxf")
+                state["test_toggle_left"].on_click(_on_test_toggle_left)
+                state["test_toggle_right"].on_click(_on_test_toggle_right)
+                state["save_button"].on_click(_on_save_dxf)
 
-        # Progress-bar overlay shown while a test is running.
-        with ui.column().classes("progress-overlay") as progress_container:
-            progress_label = ui.label("Running cassette test...").classes(
-                "text-sm text-gray-200 mb-2"
-            )
-            progress_bar = ui.linear_progress(value=0).props(
-                "color=green-6 rounded"
-            ).classes("w-full")
-        progress_container.style("display:none;")
+            # Progress-bar overlay shown while a test is running.
+            with ui.column().classes("progress-overlay") as progress_container:
+                progress_label = ui.label("Running cassette test...").classes(
+                    "text-sm text-gray-200 mb-2"
+                )
+                progress_bar = ui.linear_progress(value=0).props(
+                    "color=green-6 rounded"
+                ).classes("w-full")
+            progress_container.style("display:none;")
 
 
 #######################################################################################################
